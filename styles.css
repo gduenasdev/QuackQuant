@@ -1,0 +1,320 @@
+:root {
+  --ink: #11130f;
+  --paper: #f4f0e7;
+  --green: #2eaa58;
+  --green-dark: #1e7d3d;
+  --line: rgba(17, 19, 15, 0.14);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  background: var(--paper);
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  overflow-x: hidden;
+  color: var(--ink);
+  background:
+    radial-gradient(circle at 80% 45%, rgba(46, 170, 88, 0.09), transparent 26rem),
+    var(--paper);
+  font-family: "Manrope", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.site-header,
+footer {
+  width: min(100% - 48px, 1400px);
+  margin-inline: auto;
+}
+
+.site-header {
+  height: 104px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--line);
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  color: inherit;
+  text-decoration: none;
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: -0.04em;
+}
+
+.brand-mark {
+  width: 46px;
+  height: 46px;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border: 1px solid var(--ink);
+  border-radius: 50%;
+  background: white;
+}
+
+.brand-mark img {
+  width: 67px;
+  max-width: none;
+  transform: translateY(2px);
+}
+
+.status {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font: 500 11px/1 "DM Mono", monospace;
+  text-transform: uppercase;
+  letter-spacing: 0.11em;
+}
+
+.status i {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 0 5px rgba(46, 170, 88, 0.14);
+  animation: pulse 2.5s ease-in-out infinite;
+}
+
+.hero {
+  position: relative;
+  width: min(100% - 48px, 1400px);
+  min-height: calc(100vh - 174px);
+  margin-inline: auto;
+  display: grid;
+  grid-template-columns: 1fr 0.9fr;
+  align-items: center;
+  gap: 7vw;
+  padding: 72px 4vw 76px;
+  overflow: hidden;
+}
+
+.market-grid {
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  opacity: 0.32;
+  background-image:
+    linear-gradient(var(--line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--line) 1px, transparent 1px);
+  background-size: 64px 64px;
+  mask-image: linear-gradient(90deg, transparent, black 50%, transparent);
+}
+
+.hero-copy {
+  max-width: 720px;
+  animation: rise 0.8s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+
+.eyebrow {
+  margin: 0 0 24px;
+  font: 500 11px/1 "DM Mono", monospace;
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  color: var(--green-dark);
+}
+
+h1 {
+  max-width: 760px;
+  margin: 0;
+  font-size: clamp(58px, 7.2vw, 116px);
+  line-height: 0.88;
+  letter-spacing: -0.075em;
+  font-weight: 600;
+}
+
+h1 em {
+  position: relative;
+  color: var(--green-dark);
+  font-style: normal;
+}
+
+h1 em::after {
+  content: "";
+  position: absolute;
+  height: 7px;
+  left: 5px;
+  right: 0;
+  bottom: -4px;
+  border-radius: 100%;
+  background: var(--green);
+  transform: rotate(-1.5deg);
+}
+
+.intro {
+  max-width: 590px;
+  margin: 36px 0 44px;
+  font-size: clamp(17px, 1.3vw, 21px);
+  line-height: 1.65;
+  letter-spacing: -0.025em;
+  color: rgba(17, 19, 15, 0.67);
+}
+
+.coming-soon {
+  width: fit-content;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding-top: 20px;
+  border-top: 1px solid var(--ink);
+}
+
+.coming-soon > span {
+  font: 500 11px/1 "DM Mono", monospace;
+  color: var(--green-dark);
+}
+
+.coming-soon strong {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.coming-soon p {
+  margin: 0;
+  font: 400 11px/1.4 "DM Mono", monospace;
+  color: rgba(17, 19, 15, 0.55);
+}
+
+.hero-art {
+  position: relative;
+  justify-self: end;
+  width: min(39vw, 560px);
+  aspect-ratio: 1;
+  display: grid;
+  place-items: center;
+  animation: rise 0.8s 0.15s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+
+.logo-stage {
+  width: 78%;
+  aspect-ratio: 1;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border: 2px solid var(--ink);
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 18px 22px 0 var(--green);
+  transform: rotate(2deg);
+}
+
+.logo-stage img {
+  width: 118%;
+  max-width: none;
+  transform: translate(0, 2%);
+}
+
+.orbit {
+  position: absolute;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+}
+
+.orbit-one {
+  inset: 2%;
+}
+
+.orbit-two {
+  inset: 12%;
+  border-style: dashed;
+  animation: spin 28s linear infinite;
+}
+
+.quote-chip {
+  position: absolute;
+  right: -3%;
+  bottom: 12%;
+  padding: 12px 16px;
+  border: 1px solid var(--ink);
+  background: var(--paper);
+  font: 500 10px/1 "DM Mono", monospace;
+  letter-spacing: 0.12em;
+  transform: rotate(-4deg);
+}
+
+.quote-chip span {
+  color: var(--green-dark);
+}
+
+footer {
+  height: 70px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-top: 1px solid var(--line);
+  font: 400 10px/1 "DM Mono", monospace;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: rgba(17, 19, 15, 0.55);
+}
+
+@keyframes rise {
+  from { opacity: 0; transform: translateY(18px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes pulse {
+  50% { box-shadow: 0 0 0 8px rgba(46, 170, 88, 0); }
+}
+
+@media (max-width: 860px) {
+  .site-header,
+  footer,
+  .hero {
+    width: min(100% - 32px, 1400px);
+  }
+
+  .site-header { height: 82px; }
+
+  .hero {
+    min-height: auto;
+    grid-template-columns: 1fr;
+    gap: 72px;
+    padding: 72px 4px 92px;
+  }
+
+  .hero-copy { max-width: 650px; }
+
+  .hero-art {
+    width: min(86vw, 520px);
+    justify-self: center;
+  }
+
+  footer { height: 72px; }
+}
+
+@media (max-width: 520px) {
+  .brand { font-size: 16px; }
+  .brand-mark { width: 40px; height: 40px; }
+  .status { font-size: 9px; }
+  .status i { width: 6px; height: 6px; }
+  h1 { font-size: clamp(52px, 16vw, 76px); }
+  .intro { margin-top: 30px; }
+  .logo-stage { box-shadow: 10px 14px 0 var(--green); }
+  footer span:last-child { display: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
