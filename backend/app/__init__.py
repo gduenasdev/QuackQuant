@@ -1,0 +1,2 @@
+"""QuackQuant API package."""
+
