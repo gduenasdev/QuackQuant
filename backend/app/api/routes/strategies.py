@@ -1,4 +1,4 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Response
 
 from app.api.todos import not_implemented
 from app.schemas import StrategyCreate, StrategyUpdate
@@ -30,8 +30,7 @@ def update_strategy(strategy_id: str, payload: StrategyUpdate) -> None:
     not_implemented("Create a new immutable strategy revision.")
 
 
-@router.delete("/{strategy_id}", status_code=204)
+@router.delete("/{strategy_id}", status_code=204, response_class=Response)
 def delete_strategy(strategy_id: str) -> None:
     # TODO: Soft-delete only after checking active runs and retention requirements.
     not_implemented("Soft-delete an owned strategy after dependency checks.")
-

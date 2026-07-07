@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Header, Request
+from fastapi import APIRouter, Header, Request, Response
 
 from app.api.todos import not_implemented
 from app.schemas import BrokerConnectionCreate, OrderCreate, OrderPreviewRequest
@@ -18,7 +18,7 @@ def create_broker_connection(payload: BrokerConnectionCreate) -> None:
     not_implemented("Complete server-side OAuth and encrypt broker credentials.")
 
 
-@router.delete("/broker-connections/{connection_id}", status_code=204)
+@router.delete("/broker-connections/{connection_id}", status_code=204, response_class=Response)
 def delete_broker_connection(connection_id: str) -> None:
     # TODO: Revoke upstream tokens before deleting the local encrypted credentials.
     not_implemented("Revoke the provider token and remove the connection.")
@@ -61,4 +61,3 @@ async def broker_webhook(request: Request) -> None:
     # TODO: Verify signature against raw bytes before parsing; reject stale/replayed events.
     # TODO: Deduplicate by provider event ID, persist first, then process asynchronously.
     not_implemented("Verify, deduplicate, persist, and asynchronously process broker events.")
-

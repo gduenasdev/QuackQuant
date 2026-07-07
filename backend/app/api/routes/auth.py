@@ -13,8 +13,7 @@ def login(payload: LoginRequest) -> None:
     not_implemented("Integrate OIDC and issue a secure server-side session.")
 
 
-@router.post("/logout", status_code=204)
+@router.post("/logout", status_code=204, response_class=Response)
 def logout(response: Response) -> None:
     # TODO: Revoke the server-side session and expire its cookie.
     not_implemented("Revoke the authenticated session and clear its cookie.")
-
