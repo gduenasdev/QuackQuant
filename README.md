@@ -27,3 +27,10 @@ uvicorn app.main:app --reload --port 8001
 
 API documentation is available at <http://127.0.0.1:8001/docs>. See
 [`backend/IMPLEMENTATION_TODO.md`](backend/IMPLEMENTATION_TODO.md) for the recommended build order.
+
+## Trading research
+
+Read [`docs/TRADING_RESEARCH.md`](docs/TRADING_RESEARCH.md) before implementing backtests, scanners,
+strategy logic, or broker execution. It covers realistic objective-setting, multi-symbol research,
+backtesting, liquidity-sweep hypotheses, training stages, risk controls, and the current U.S.
+intraday-margin transition.
