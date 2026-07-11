@@ -1,0 +1,73 @@
+services:
+  web:
+    image: caddy:2-alpine
+    container_name: quackquant-web
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${QUACKQUANT_HTTP_PORT:-8080}:80"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./index.html:/srv/index.html:ro
+      - ./styles.css:/srv/styles.css:ro
+      - ./images:/srv/images:ro
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+    image: quackquant-api:local
+    container_name: quackquant-api
+    environment:
+      QUACKQUANT_ENVIRONMENT: production
+      QUACKQUANT_API_PREFIX: /api/v1
+      QUACKQUANT_ALLOWED_ORIGINS: '["http://localhost:${QUACKQUANT_HTTP_PORT:-8080}","http://127.0.0.1:${QUACKQUANT_HTTP_PORT:-8080}","http://${MAC_STUDIO_HOSTNAME:-localhost}:${QUACKQUANT_HTTP_PORT:-8080}"]'
+      QUACKQUANT_DATABASE_URL: postgresql+psycopg://quackquant:${POSTGRES_PASSWORD:-quackquant_change_me}@postgres:5432/quackquant
+      QUACKQUANT_REDIS_URL: redis://redis:6379/0
+      QUACKQUANT_MODEL_SERVER_BASE_URL: ${QUACKQUANT_MODEL_SERVER_BASE_URL:-http://host.docker.internal:8002}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: quackquant-postgres
+    environment:
+      POSTGRES_DB: quackquant
+      POSTGRES_USER: quackquant
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-quackquant_change_me}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U quackquant -d quackquant"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: quackquant-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  redis-data:

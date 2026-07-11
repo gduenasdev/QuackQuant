@@ -28,6 +28,22 @@ uvicorn app.main:app --reload --port 8001
 API documentation is available at <http://127.0.0.1:8001/docs>. See
 [`backend/IMPLEMENTATION_TODO.md`](backend/IMPLEMENTATION_TODO.md) for the recommended build order.
 
+## Mac Studio deployment
+
+Use a venv while developing, then use Docker Compose for the always-on Mac Studio app stack:
+
+```bash
+cp deploy/.env.example .env
+docker compose up --build -d
+```
+
+Open <http://localhost:8080>. The Compose stack runs Caddy, the static website, FastAPI, Postgres,
+and Redis. Keep local model serving separate and native on the Mac Studio, exposed through an
+OpenAI-compatible endpoint such as `http://127.0.0.1:8002`; the backend container reaches it through
+`http://host.docker.internal:8002`.
+
+See [`deploy/README.md`](deploy/README.md) for the full deployment guide.
+
 ## Trading research
 
 Read [`docs/TRADING_RESEARCH.md`](docs/TRADING_RESEARCH.md) before implementing backtests, scanners,
