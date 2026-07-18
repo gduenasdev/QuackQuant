@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, time as clock_time, timedelta
+from pathlib import Path
 from statistics import mean
 from typing import Literal
 from urllib.parse import urlencode
@@ -21,6 +24,26 @@ StratScenario = Literal["1", "2U", "2D", "3"]
 EASTERN = ZoneInfo("America/New_York")
 MARKET_OPEN = clock_time(9, 30)
 MARKET_CLOSE = clock_time(16, 0)
+DEFAULT_JOURNAL_PATH = Path(__file__).with_name("stock_monitor_journal.csv")
+JOURNAL_COOLDOWN_MINUTES = 60
+JOURNAL_FIELDS = [
+    "id",
+    "opened_at",
+    "closed_at",
+    "symbol",
+    "side",
+    "setup",
+    "grade",
+    "confidence",
+    "entry_price",
+    "stop_price",
+    "target_1_price",
+    "target_2_price",
+    "last_price",
+    "status",
+    "result_pct",
+    "reasons",
+]
 
 
 @dataclass(frozen=True)
@@ -839,6 +862,155 @@ def format_pattern_summary(symbol: str, checkpoint_candles: list[Candle]) -> str
     return f"{symbol:<5} patterns: " + (", ".join(parts) if parts else "none")
 
 
+def read_journal(journal_path: Path) -> list[dict[str, str]]:
+    if not journal_path.exists():
+        return []
+
+    with journal_path.open(newline="") as file:
+        return list(csv.DictReader(file))
+
+
+def write_journal(journal_path: Path, rows: list[dict[str, str]]) -> None:
+    journal_path.parent.mkdir(parents=True, exist_ok=True)
+    with journal_path.open("w", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=JOURNAL_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def journal_signal_id(signal: SetupSignal) -> str:
+    timestamp = signal.observed_at.strftime("%Y%m%dT%H%M")
+    return f"{timestamp}-{signal.symbol}-{signal.side}-{signal.setup}-{signal.grade}"
+
+
+def signal_to_journal_row(signal: SetupSignal) -> dict[str, str]:
+    return {
+        "id": journal_signal_id(signal),
+        "opened_at": signal.observed_at.isoformat(),
+        "closed_at": "",
+        "symbol": signal.symbol,
+        "side": signal.side,
+        "setup": signal.setup,
+        "grade": signal.grade,
+        "confidence": str(signal.confidence),
+        "entry_price": format_optional_price(signal.entry_price),
+        "stop_price": format_optional_price(signal.stop_price),
+        "target_1_price": format_optional_price(signal.target_1_price),
+        "target_2_price": format_optional_price(signal.target_2_price),
+        "last_price": f"{signal.price:.2f}",
+        "status": "OPEN",
+        "result_pct": "0.000",
+        "reasons": " | ".join(signal.reasons[:6]),
+    }
+
+
+def format_optional_price(price: float | None) -> str:
+    return f"{price:.2f}" if price is not None else ""
+
+
+def has_open_trade(rows: list[dict[str, str]], signal: SetupSignal) -> bool:
+    return any(
+        row.get("status") == "OPEN"
+        and row.get("symbol") == signal.symbol
+        and row.get("side") == signal.side
+        for row in rows
+    )
+
+
+def has_recent_trade(rows: list[dict[str, str]], signal: SetupSignal) -> bool:
+    for row in rows:
+        if row.get("symbol") != signal.symbol or row.get("side") != signal.side:
+            continue
+
+        opened_at = datetime.fromisoformat(row["opened_at"])
+        if signal.observed_at - opened_at <= timedelta(minutes=JOURNAL_COOLDOWN_MINUTES):
+            return True
+
+    return False
+
+
+def update_trade_status(row: dict[str, str], current_price: float, observed_at: datetime) -> None:
+    if row.get("status") != "OPEN":
+        return
+
+    side = row["side"]
+    entry_price = float(row["entry_price"])
+    stop_price = float(row["stop_price"])
+    target_1_price = float(row["target_1_price"])
+    target_2_price = float(row["target_2_price"])
+    row["last_price"] = f"{current_price:.2f}"
+
+    status = "OPEN"
+    if side == "LONG":
+        if current_price <= stop_price:
+            status = "STOPPED"
+        elif current_price >= target_2_price:
+            status = "TARGET_2"
+        elif current_price >= target_1_price:
+            status = "TARGET_1"
+        result_pct = ((current_price - entry_price) / entry_price) * 100
+    else:
+        if current_price >= stop_price:
+            status = "STOPPED"
+        elif current_price <= target_2_price:
+            status = "TARGET_2"
+        elif current_price <= target_1_price:
+            status = "TARGET_1"
+        result_pct = ((entry_price - current_price) / entry_price) * 100
+
+    row["result_pct"] = f"{result_pct:.3f}"
+    if status != "OPEN":
+        row["status"] = status
+        row["closed_at"] = observed_at.isoformat()
+
+
+def update_journal(journal_path: Path, signals: list[SetupSignal]) -> dict[str, int]:
+    rows = read_journal(journal_path)
+    latest_prices = {signal.symbol: signal.price for signal in signals}
+    latest_times = {signal.symbol: signal.observed_at for signal in signals}
+    closed_count = 0
+    added_count = 0
+
+    for row in rows:
+        symbol = row.get("symbol", "")
+        if symbol not in latest_prices or row.get("status") != "OPEN":
+            continue
+
+        previous_status = row["status"]
+        update_trade_status(row, latest_prices[symbol], latest_times[symbol])
+        if row["status"] != previous_status:
+            closed_count += 1
+
+    for signal in signals:
+        if signal.side == "WAIT" or signal.entry_price is None:
+            continue
+        if has_open_trade(rows, signal) or has_recent_trade(rows, signal):
+            continue
+
+        rows.append(signal_to_journal_row(signal))
+        added_count += 1
+
+    write_journal(journal_path, rows)
+    return {"added": added_count, "closed": closed_count, "open": count_open_trades(rows)}
+
+
+def count_open_trades(rows: list[dict[str, str]]) -> int:
+    return sum(row.get("status") == "OPEN" for row in rows)
+
+
+def summarize_journal(journal_path: Path) -> str:
+    rows = read_journal(journal_path)
+    closed = [row for row in rows if row.get("status") in {"TARGET_1", "TARGET_2", "STOPPED"}]
+    winners = [row for row in closed if row.get("status") in {"TARGET_1", "TARGET_2"}]
+    open_count = count_open_trades(rows)
+    win_rate = (len(winners) / len(closed) * 100) if closed else 0
+    avg_result = mean(float(row["result_pct"]) for row in closed) if closed else 0
+    return (
+        f"journal={journal_path} total={len(rows)} open={open_count} closed={len(closed)} "
+        f"wins={len(winners)} win_rate={win_rate:.1f}% avg_result={avg_result:.3f}%"
+    )
+
+
 def run_once(
     symbols: list[str],
     checkpoint_minutes: int,
@@ -913,8 +1085,20 @@ def run_live_monitor() -> None:
         type=int,
         default=int(os.getenv("QUACKQUANT_POLL_SECONDS", "300")),
     )
+    parser.add_argument(
+        "--journal",
+        type=Path,
+        default=Path(os.getenv("QUACKQUANT_JOURNAL", DEFAULT_JOURNAL_PATH)),
+        help="CSV paper-trade journal path",
+    )
+    parser.add_argument("--no-journal", action="store_true", help="Disable paper journal updates")
+    parser.add_argument("--journal-summary", action="store_true", help="Print journal summary and exit")
     parser.add_argument("--once", action="store_true")
     args = parser.parse_args()
+
+    if args.journal_summary:
+        print(summarize_journal(args.journal))
+        return
 
     symbols = parse_symbols(args.symbols, args.watchlist)
     strategy = CheckpointConfluenceStrategy(
@@ -949,6 +1133,14 @@ def run_live_monitor() -> None:
         )
         for signal in sorted(signals, key=lambda item: item.confidence, reverse=True):
             print(format_signal(signal))
+
+        if not args.no_journal:
+            journal_stats = update_journal(args.journal, signals)
+            print(
+                f"journal updated: added={journal_stats['added']} "
+                f"closed={journal_stats['closed']} open={journal_stats['open']} "
+                f"path={args.journal}"
+            )
 
         if args.once:
             return
@@ -1137,6 +1329,92 @@ def test_timeframe_continuity_bias() -> None:
 
     assert timeframe_continuity_bias(bullish) == "LONG"
     assert timeframe_continuity_bias(mixed) == "WAIT"
+
+
+def test_journal_records_and_closes_long_target() -> None:
+    journal_path = Path(tempfile.mkdtemp()) / "journal.csv"
+    observed_at = datetime(2026, 7, 17, 10, 0, tzinfo=EASTERN)
+    signal = SetupSignal(
+        symbol="SPY",
+        side="LONG",
+        setup="breakout",
+        confidence=85,
+        grade="A",
+        price=100,
+        entry_price=100,
+        stop_price=99,
+        target_1_price=101,
+        target_2_price=102,
+        risk_pct=1,
+        target_1_pct=1,
+        target_2_pct=2,
+        reward_to_risk=1,
+        reasons=["test"],
+        warnings=[],
+        observed_at=observed_at,
+    )
+
+    first_stats = update_journal(journal_path, [signal])
+    second_stats = update_journal(
+        journal_path,
+        [
+            SetupSignal(
+                **{
+                    **signal.__dict__,
+                    "price": 101.5,
+                    "observed_at": observed_at + timedelta(minutes=30),
+                }
+            )
+        ],
+    )
+    rows = read_journal(journal_path)
+
+    assert first_stats == {"added": 1, "closed": 0, "open": 1}
+    assert second_stats == {"added": 0, "closed": 1, "open": 0}
+    assert rows[0]["status"] == "TARGET_1"
+    assert rows[0]["result_pct"] == "1.500"
+
+
+def test_journal_records_and_closes_short_stop() -> None:
+    journal_path = Path(tempfile.mkdtemp()) / "journal.csv"
+    observed_at = datetime(2026, 7, 17, 10, 0, tzinfo=EASTERN)
+    signal = SetupSignal(
+        symbol="QQQ",
+        side="SHORT",
+        setup="breakout",
+        confidence=85,
+        grade="A",
+        price=100,
+        entry_price=100,
+        stop_price=101,
+        target_1_price=99,
+        target_2_price=98,
+        risk_pct=1,
+        target_1_pct=1,
+        target_2_pct=2,
+        reward_to_risk=1,
+        reasons=["test"],
+        warnings=[],
+        observed_at=observed_at,
+    )
+
+    update_journal(journal_path, [signal])
+    update_journal(
+        journal_path,
+        [
+            SetupSignal(
+                **{
+                    **signal.__dict__,
+                    "price": 101.2,
+                    "observed_at": observed_at + timedelta(minutes=30),
+                }
+            )
+        ],
+    )
+    rows = read_journal(journal_path)
+
+    assert rows[0]["status"] == "STOPPED"
+    assert rows[0]["result_pct"] == "-1.200"
 
 
 def test_aggregate_checkpoint_candles_from_5m_data() -> None:

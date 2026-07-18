@@ -3,6 +3,12 @@
 This monitor is a paper-only setup scanner. It prints possible trade setups with entry, stop,
 targets, confidence, and reasons. It never places trades.
 
+By default, it also records paper trade calls to:
+
+```text
+backend/tests/stock_monitor_journal.csv
+```
+
 ## Market Hours
 
 Regular U.S. equity market hours are 9:30am to 4:00pm Eastern Time, Monday through Friday.
@@ -42,6 +48,8 @@ python tests/test_stock_monitor_strategy.py \
   --poll-seconds 300
 ```
 
+This will print scanner output and update the paper journal every poll.
+
 Run a 60-minute scanner:
 
 ```bash
@@ -58,6 +66,15 @@ python tests/test_stock_monitor_strategy.py \
   --symbols SPY,QQQ,AAPL,NVDA \
   --checkpoint-minutes 30 \
   --once
+```
+
+Run without writing the journal:
+
+```bash
+python tests/test_stock_monitor_strategy.py \
+  --symbols SPY,QQQ \
+  --checkpoint-minutes 30 \
+  --no-journal
 ```
 
 ## Watchlist File
@@ -131,6 +148,52 @@ Useful grades:
 - `WATCH`: context is forming, do not force it
 - `NO_TRADE`: skip
 
+## Paper Journal
+
+The scanner records `LONG` and `SHORT` calls to CSV. It does not record `WAIT` rows.
+
+Each journal row includes:
+
+- signal time
+- symbol
+- side
+- setup
+- grade
+- confidence score
+- entry
+- stop
+- target 1
+- target 2
+- latest price checked
+- status
+- result percentage
+- signal reasons
+
+Statuses:
+
+- `OPEN`: target or stop has not been hit yet
+- `TARGET_1`: price reached the first target
+- `TARGET_2`: price reached the second target
+- `STOPPED`: price reached the stop
+
+Show journal stats:
+
+```bash
+python tests/test_stock_monitor_strategy.py --journal-summary
+```
+
+Use a custom journal file:
+
+```bash
+python tests/test_stock_monitor_strategy.py \
+  --symbols SPY,QQQ \
+  --checkpoint-minutes 30 \
+  --journal paper_logs/monday.csv
+```
+
+The script has a 60-minute same-symbol/same-side cooldown so one setup is not counted repeatedly
+while it stays visible on the chart.
+
 ## First-Day Rules
 
 For the first live morning, keep it boring:
@@ -183,7 +246,8 @@ After the open:
 After the session:
 
 - Save screenshots of every setup you considered.
-- Record signal grade, entry, stop, target, and whether you followed the plan.
+- Review `stock_monitor_journal.csv`.
+- Compare the journal against chart screenshots.
 - Do not change the rules mid-session.
 
 ## Important Limits
