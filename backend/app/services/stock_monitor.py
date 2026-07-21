@@ -1,0 +1,1449 @@
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import tempfile
+import time
+from dataclasses import dataclass
+from datetime import datetime, time as clock_time, timedelta
+from pathlib import Path
+from statistics import mean
+from typing import Literal
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
+
+
+SignalSide = Literal["LONG", "SHORT", "WAIT"]
+SetupName = Literal["continuation", "breakout", "rejection", "chop", "insufficient_data"]
+PatternSide = Literal["bullish", "bearish"]
+StratScenario = Literal["1", "2U", "2D", "3"]
+
+EASTERN = ZoneInfo("America/New_York")
+MARKET_OPEN = clock_time(9, 30)
+MARKET_CLOSE = clock_time(16, 0)
+DEFAULT_JOURNAL_PATH = Path(__file__).with_name("stock_monitor_journal.csv")
+JOURNAL_COOLDOWN_MINUTES = 60
+JOURNAL_FIELDS = [
+    "id",
+    "opened_at",
+    "closed_at",
+    "symbol",
+    "side",
+    "setup",
+    "grade",
+    "confidence",
+    "entry_price",
+    "stop_price",
+    "target_1_price",
+    "target_2_price",
+    "last_price",
+    "status",
+    "result_pct",
+    "reasons",
+]
+
+
+@dataclass(frozen=True)
+class Quote:
+    symbol: str
+    price: float
+    observed_at: datetime
+
+
+@dataclass(frozen=True)
+class Candle:
+    symbol: str
+    opened_at: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float = 0
+
+
+@dataclass(frozen=True)
+class KeyLevels:
+    symbol: str
+    checkpoint_minutes: int
+    current_open: float
+    previous_high: float
+    previous_low: float
+    zone_low: float
+    zone_high: float
+    built_at: datetime
+
+
+@dataclass(frozen=True)
+class FairValueGap:
+    symbol: str
+    side: PatternSide
+    lower_bound: float
+    upper_bound: float
+    formed_at: datetime
+    mitigated: bool
+
+
+@dataclass(frozen=True)
+class LiquiditySweep:
+    symbol: str
+    side: PatternSide
+    liquidity_level: float
+    sweep_price: float
+    choch_level: float
+    confirmed_at: datetime
+
+
+@dataclass(frozen=True)
+class StratSignal:
+    symbol: str
+    side: PatternSide
+    pattern: str
+    trigger_price: float
+    stop_price: float
+    formed_at: datetime
+
+
+@dataclass(frozen=True)
+class SetupSignal:
+    symbol: str
+    side: SignalSide
+    setup: SetupName
+    confidence: int
+    grade: str
+    price: float
+    entry_price: float | None
+    stop_price: float | None
+    target_1_price: float | None
+    target_2_price: float | None
+    risk_pct: float
+    target_1_pct: float
+    target_2_pct: float
+    reward_to_risk: float
+    reasons: list[str]
+    warnings: list[str]
+    observed_at: datetime
+
+
+class CheckpointConfluenceStrategy:
+    """Paper-only setup scanner using hourly-style levels plus confluence scoring."""
+
+    def __init__(
+        self,
+        risk_pct: float = 0.15,
+        target_1_pct: float = 0.30,
+        target_2_pct: float = 0.45,
+        zone_width_pct: float = 0.03,
+        breakout_buffer_pct: float = 0.02,
+        min_trade_score: int = 65,
+        strong_trade_score: int = 80,
+    ) -> None:
+        self.risk_pct = risk_pct
+        self.target_1_pct = target_1_pct
+        self.target_2_pct = target_2_pct
+        self.zone_width_pct = zone_width_pct
+        self.breakout_buffer_pct = breakout_buffer_pct
+        self.min_trade_score = min_trade_score
+        self.strong_trade_score = strong_trade_score
+
+    @property
+    def reward_to_risk(self) -> float:
+        return self.target_1_pct / self.risk_pct
+
+    def build_levels(self, completed_checkpoint_candle: Candle, checkpoint_minutes: int) -> KeyLevels:
+        zone_width = completed_checkpoint_candle.open * (self.zone_width_pct / 100)
+        return KeyLevels(
+            symbol=completed_checkpoint_candle.symbol,
+            checkpoint_minutes=checkpoint_minutes,
+            current_open=completed_checkpoint_candle.open,
+            previous_high=completed_checkpoint_candle.high,
+            previous_low=completed_checkpoint_candle.low,
+            zone_low=completed_checkpoint_candle.open - zone_width,
+            zone_high=completed_checkpoint_candle.open + zone_width,
+            built_at=completed_checkpoint_candle.opened_at,
+        )
+
+    def evaluate(
+        self,
+        quote: Quote,
+        levels: KeyLevels,
+        checkpoint_candles: list[Candle],
+        market_bias: SignalSide = "WAIT",
+    ) -> SetupSignal:
+        if len(checkpoint_candles) < 4:
+            return self._wait_signal(
+                quote=quote,
+                levels=levels,
+                setup="insufficient_data",
+                confidence=0,
+                reasons=["need at least 4 completed checkpoint candles"],
+                warnings=["wait for more 30m/60m structure before trusting signals"],
+            )
+
+        pattern_reasons = describe_active_patterns(checkpoint_candles)
+        long_score, long_reasons, long_warnings = self._score_side(
+            side="LONG",
+            quote=quote,
+            levels=levels,
+            checkpoint_candles=checkpoint_candles,
+            market_bias=market_bias,
+        )
+        short_score, short_reasons, short_warnings = self._score_side(
+            side="SHORT",
+            quote=quote,
+            levels=levels,
+            checkpoint_candles=checkpoint_candles,
+            market_bias=market_bias,
+        )
+
+        if max(long_score, short_score) < self.min_trade_score:
+            setup: SetupName = "rejection" if levels.zone_low <= quote.price <= levels.zone_high else "chop"
+            reasons = [
+                f"no side reached {self.min_trade_score}+ confidence",
+                f"long_score={long_score}",
+                f"short_score={short_score}",
+                f"checkpoint range {levels.previous_low:.2f}-{levels.previous_high:.2f}",
+            ] + pattern_reasons
+            warnings = ["no paper entry; wait for cleaner confluence"]
+            return self._wait_signal(
+                quote=quote,
+                levels=levels,
+                setup=setup,
+                confidence=max(long_score, short_score),
+                reasons=reasons,
+                warnings=warnings,
+            )
+
+        if long_score >= short_score:
+            setup = "breakout" if quote.price > levels.previous_high else "continuation"
+            return self._trade_signal(
+                quote=quote,
+                side="LONG",
+                setup=setup,
+                confidence=long_score,
+                reasons=unique_reasons(long_reasons + pattern_reasons),
+                warnings=long_warnings,
+            )
+
+        setup = "breakout" if quote.price < levels.previous_low else "continuation"
+        return self._trade_signal(
+            quote=quote,
+            side="SHORT",
+            setup=setup,
+            confidence=short_score,
+            reasons=unique_reasons(short_reasons + pattern_reasons),
+            warnings=short_warnings,
+        )
+
+    def _score_side(
+        self,
+        side: Literal["LONG", "SHORT"],
+        quote: Quote,
+        levels: KeyLevels,
+        checkpoint_candles: list[Candle],
+        market_bias: SignalSide,
+    ) -> tuple[int, list[str], list[str]]:
+        recent = checkpoint_candles[-1]
+        previous = checkpoint_candles[-2]
+        closes = [candle.close for candle in checkpoint_candles]
+        volumes = [candle.volume for candle in checkpoint_candles if candle.volume > 0]
+        avg_volume = mean(volumes[-20:]) if volumes else 0
+        recent_volume = recent.volume
+        ema_fast = ema(closes, 8)
+        ema_slow = ema(closes, 21)
+        fair_value_gaps = detect_fair_value_gaps(checkpoint_candles)
+        liquidity_sweeps = detect_liquidity_sweeps(checkpoint_candles)
+        bullish_fvg = latest_active_gap(fair_value_gaps, "bullish")
+        bearish_fvg = latest_active_gap(fair_value_gaps, "bearish")
+        bullish_sweep = latest_sweep(liquidity_sweeps, "bullish")
+        bearish_sweep = latest_sweep(liquidity_sweeps, "bearish")
+        strat_signals = detect_strat_signals(checkpoint_candles)
+        bullish_strat = latest_strat_signal(strat_signals, "bullish")
+        bearish_strat = latest_strat_signal(strat_signals, "bearish")
+        tfc_bias = timeframe_continuity_bias(checkpoint_candles)
+
+        score = 0
+        reasons: list[str] = []
+        warnings: list[str] = []
+
+        if side == "LONG":
+            breakout = levels.previous_high * (1 + self.breakout_buffer_pct / 100)
+            above_level = quote.price >= breakout
+            above_open = quote.price > levels.current_open
+            trend_aligned = ema_fast > ema_slow and recent.close > ema_fast
+            structure_aligned = recent.high > previous.high and recent.low >= previous.low
+            volume_confirmed = avg_volume > 0 and recent_volume >= avg_volume
+            market_aligned = market_bias in ("LONG", "WAIT")
+            fvg_aligned = bullish_fvg is not None and quote.price >= bullish_fvg.upper_bound
+            sweep_aligned = bullish_sweep is not None
+            strat_aligned = bullish_strat is not None and quote.price >= bullish_strat.trigger_price
+            tfc_aligned = tfc_bias in ("LONG", "WAIT")
+
+            checks = [
+                (above_level, 25, f"price broke above {levels.checkpoint_minutes}m high"),
+                (above_open, 15, "price is above checkpoint open"),
+                (trend_aligned, 20, "fast EMA is above slow EMA"),
+                (structure_aligned, 15, "higher-high / higher-low structure"),
+                (volume_confirmed, 15, "volume is at or above recent average"),
+                (market_aligned, 10, "market bias does not fight long setup"),
+                (fvg_aligned, 10, "bullish FVG remains active below price"),
+                (sweep_aligned, 15, "bullish liquidity sweep with CHOCH confirmed"),
+                (strat_aligned, 20, f"bullish Strat signal in-force: {bullish_strat.pattern if bullish_strat else ''}"),
+                (tfc_aligned, 10, "checkpoint timeframe continuity supports long or is neutral"),
+            ]
+        else:
+            breakdown = levels.previous_low * (1 - self.breakout_buffer_pct / 100)
+            below_level = quote.price <= breakdown
+            below_open = quote.price < levels.current_open
+            trend_aligned = ema_fast < ema_slow and recent.close < ema_fast
+            structure_aligned = recent.low < previous.low and recent.high <= previous.high
+            volume_confirmed = avg_volume > 0 and recent_volume >= avg_volume
+            market_aligned = market_bias in ("SHORT", "WAIT")
+            fvg_aligned = bearish_fvg is not None and quote.price <= bearish_fvg.lower_bound
+            sweep_aligned = bearish_sweep is not None
+            strat_aligned = bearish_strat is not None and quote.price <= bearish_strat.trigger_price
+            tfc_aligned = tfc_bias in ("SHORT", "WAIT")
+
+            checks = [
+                (below_level, 25, f"price broke below {levels.checkpoint_minutes}m low"),
+                (below_open, 15, "price is below checkpoint open"),
+                (trend_aligned, 20, "fast EMA is below slow EMA"),
+                (structure_aligned, 15, "lower-low / lower-high structure"),
+                (volume_confirmed, 15, "volume is at or above recent average"),
+                (market_aligned, 10, "market bias does not fight short setup"),
+                (fvg_aligned, 10, "bearish FVG remains active above price"),
+                (sweep_aligned, 15, "bearish liquidity sweep with CHOCH confirmed"),
+                (strat_aligned, 20, f"bearish Strat signal in-force: {bearish_strat.pattern if bearish_strat else ''}"),
+                (tfc_aligned, 10, "checkpoint timeframe continuity supports short or is neutral"),
+            ]
+
+        for passed, points, reason in checks:
+            if passed:
+                score += points
+                reasons.append(f"+{points} {reason}")
+
+        if levels.zone_low <= quote.price <= levels.zone_high:
+            score -= 20
+            warnings.append("-20 price is inside checkpoint open zone")
+
+        if recent.high == recent.low:
+            score -= 20
+            warnings.append("-20 latest checkpoint candle has no usable range")
+
+        return max(0, min(score, 100)), reasons, warnings
+
+    def _trade_signal(
+        self,
+        quote: Quote,
+        side: Literal["LONG", "SHORT"],
+        setup: SetupName,
+        confidence: int,
+        reasons: list[str],
+        warnings: list[str],
+    ) -> SetupSignal:
+        if side == "LONG":
+            stop_price = quote.price * (1 - self.risk_pct / 100)
+            target_1_price = quote.price * (1 + self.target_1_pct / 100)
+            target_2_price = quote.price * (1 + self.target_2_pct / 100)
+        else:
+            stop_price = quote.price * (1 + self.risk_pct / 100)
+            target_1_price = quote.price * (1 - self.target_1_pct / 100)
+            target_2_price = quote.price * (1 - self.target_2_pct / 100)
+
+        return SetupSignal(
+            symbol=quote.symbol,
+            side=side,
+            setup=setup,
+            confidence=confidence,
+            grade=self._grade(confidence),
+            price=quote.price,
+            entry_price=quote.price,
+            stop_price=stop_price,
+            target_1_price=target_1_price,
+            target_2_price=target_2_price,
+            risk_pct=self.risk_pct,
+            target_1_pct=self.target_1_pct,
+            target_2_pct=self.target_2_pct,
+            reward_to_risk=self.reward_to_risk,
+            reasons=reasons,
+            warnings=warnings,
+            observed_at=quote.observed_at,
+        )
+
+    def _wait_signal(
+        self,
+        quote: Quote,
+        levels: KeyLevels,
+        setup: SetupName,
+        confidence: int,
+        reasons: list[str],
+        warnings: list[str],
+    ) -> SetupSignal:
+        return SetupSignal(
+            symbol=quote.symbol,
+            side="WAIT",
+            setup=setup,
+            confidence=confidence,
+            grade=self._grade(confidence),
+            price=quote.price,
+            entry_price=None,
+            stop_price=None,
+            target_1_price=None,
+            target_2_price=None,
+            risk_pct=self.risk_pct,
+            target_1_pct=self.target_1_pct,
+            target_2_pct=self.target_2_pct,
+            reward_to_risk=self.reward_to_risk,
+            reasons=reasons
+            + [
+                f"open zone {levels.zone_low:.2f}-{levels.zone_high:.2f}",
+                f"checkpoint high/low {levels.previous_high:.2f}/{levels.previous_low:.2f}",
+            ],
+            warnings=warnings,
+            observed_at=quote.observed_at,
+        )
+
+    def _grade(self, confidence: int) -> str:
+        if confidence >= self.strong_trade_score:
+            return "A"
+        if confidence >= self.min_trade_score:
+            return "B"
+        if confidence >= 50:
+            return "WATCH"
+        return "NO_TRADE"
+
+
+def ema(values: list[float], period: int) -> float:
+    if not values:
+        return 0
+
+    multiplier = 2 / (period + 1)
+    result = values[0]
+    for value in values[1:]:
+        result = (value - result) * multiplier + result
+    return result
+
+
+def detect_fair_value_gaps(
+    candles: list[Candle],
+    min_gap_pct: float = 0.03,
+) -> list[FairValueGap]:
+    gaps: list[FairValueGap] = []
+    for index in range(2, len(candles)):
+        first = candles[index - 2]
+        current = candles[index]
+
+        if current.low > first.high:
+            gap_pct = ((current.low - first.high) / first.high) * 100
+            if gap_pct >= min_gap_pct:
+                gaps.append(
+                    FairValueGap(
+                        symbol=current.symbol,
+                        side="bullish",
+                        lower_bound=first.high,
+                        upper_bound=current.low,
+                        formed_at=current.opened_at,
+                        mitigated=gap_was_mitigated(
+                            candles[index + 1 :],
+                            side="bullish",
+                            lower_bound=first.high,
+                            upper_bound=current.low,
+                        ),
+                    )
+                )
+
+        if current.high < first.low:
+            gap_pct = ((first.low - current.high) / first.low) * 100
+            if gap_pct >= min_gap_pct:
+                gaps.append(
+                    FairValueGap(
+                        symbol=current.symbol,
+                        side="bearish",
+                        lower_bound=current.high,
+                        upper_bound=first.low,
+                        formed_at=current.opened_at,
+                        mitigated=gap_was_mitigated(
+                            candles[index + 1 :],
+                            side="bearish",
+                            lower_bound=current.high,
+                            upper_bound=first.low,
+                        ),
+                    )
+                )
+
+    return gaps
+
+
+def gap_was_mitigated(
+    future_candles: list[Candle],
+    side: PatternSide,
+    lower_bound: float,
+    upper_bound: float,
+) -> bool:
+    midpoint = (lower_bound + upper_bound) / 2
+    for candle in future_candles:
+        if side == "bullish" and candle.low <= midpoint:
+            return True
+        if side == "bearish" and candle.high >= midpoint:
+            return True
+    return False
+
+
+def latest_active_gap(gaps: list[FairValueGap], side: PatternSide) -> FairValueGap | None:
+    for gap in reversed(gaps):
+        if gap.side == side and not gap.mitigated:
+            return gap
+    return None
+
+
+def detect_liquidity_sweeps(
+    candles: list[Candle],
+    lookback: int = 4,
+    equal_level_tolerance_pct: float = 0.05,
+) -> list[LiquiditySweep]:
+    sweeps: list[LiquiditySweep] = []
+    if len(candles) < lookback + 1:
+        return sweeps
+
+    for index in range(lookback, len(candles)):
+        prior = candles[index - lookback : index]
+        current = candles[index]
+        prior_high = max(candle.high for candle in prior)
+        prior_low = min(candle.low for candle in prior)
+        prior_high_base = mean(candle.high for candle in prior)
+        prior_low_base = mean(candle.low for candle in prior)
+        high_tolerance = prior_high_base * (equal_level_tolerance_pct / 100)
+        low_tolerance = prior_low_base * (equal_level_tolerance_pct / 100)
+
+        equal_highs = sum(abs(candle.high - prior_high) <= high_tolerance for candle in prior) >= 2
+        equal_lows = sum(abs(candle.low - prior_low) <= low_tolerance for candle in prior) >= 2
+
+        swept_lows = equal_lows and current.low < prior_low and current.close > prior_low
+        swept_highs = equal_highs and current.high > prior_high and current.close < prior_high
+
+        if swept_lows:
+            choch_level = max(candle.high for candle in prior[-2:])
+            if current.close > choch_level:
+                sweeps.append(
+                    LiquiditySweep(
+                        symbol=current.symbol,
+                        side="bullish",
+                        liquidity_level=prior_low,
+                        sweep_price=current.low,
+                        choch_level=choch_level,
+                        confirmed_at=current.opened_at,
+                    )
+                )
+
+        if swept_highs:
+            choch_level = min(candle.low for candle in prior[-2:])
+            if current.close < choch_level:
+                sweeps.append(
+                    LiquiditySweep(
+                        symbol=current.symbol,
+                        side="bearish",
+                        liquidity_level=prior_high,
+                        sweep_price=current.high,
+                        choch_level=choch_level,
+                        confirmed_at=current.opened_at,
+                    )
+                )
+
+    return sweeps
+
+
+def latest_sweep(sweeps: list[LiquiditySweep], side: PatternSide) -> LiquiditySweep | None:
+    for sweep in reversed(sweeps):
+        if sweep.side == side:
+            return sweep
+    return None
+
+
+def classify_strat_scenario(current: Candle, previous: Candle) -> StratScenario:
+    breaks_high = current.high > previous.high
+    breaks_low = current.low < previous.low
+
+    if breaks_high and breaks_low:
+        return "3"
+    if breaks_high:
+        return "2U"
+    if breaks_low:
+        return "2D"
+    return "1"
+
+
+def strat_scenarios(candles: list[Candle]) -> list[StratScenario]:
+    if len(candles) < 2:
+        return []
+
+    return [
+        classify_strat_scenario(current=candles[index], previous=candles[index - 1])
+        for index in range(1, len(candles))
+    ]
+
+
+def detect_strat_signals(candles: list[Candle]) -> list[StratSignal]:
+    if len(candles) < 3:
+        return []
+
+    scenarios = strat_scenarios(candles)
+    signals: list[StratSignal] = []
+    for scenario_index in range(2, len(scenarios)):
+        combo = scenarios[scenario_index - 2 : scenario_index + 1]
+        current = candles[scenario_index + 1]
+        previous = candles[scenario_index]
+
+        if combo == ["2U", "1", "2U"]:
+            signals.append(strat_signal("2-1-2 continuation", "bullish", current, previous))
+        elif combo == ["2D", "1", "2D"]:
+            signals.append(strat_signal("2-1-2 continuation", "bearish", current, previous))
+        elif combo == ["2D", "1", "2U"]:
+            signals.append(strat_signal("2-1-2 reversal", "bullish", current, previous))
+        elif combo == ["2U", "1", "2D"]:
+            signals.append(strat_signal("2-1-2 reversal", "bearish", current, previous))
+        elif combo == ["3", "1", "2U"]:
+            signals.append(strat_signal("3-1-2 reversal", "bullish", current, previous))
+        elif combo == ["3", "1", "2D"]:
+            signals.append(strat_signal("3-1-2 reversal", "bearish", current, previous))
+        elif combo == ["1", "2D", "2U"]:
+            signals.append(strat_signal("1-2-2 revstrat", "bullish", current, previous))
+        elif combo == ["1", "2U", "2D"]:
+            signals.append(strat_signal("1-2-2 revstrat", "bearish", current, previous))
+        elif combo[-2:] == ["2D", "2U"]:
+            signals.append(strat_signal("2-2 reversal", "bullish", current, previous))
+        elif combo[-2:] == ["2U", "2D"]:
+            signals.append(strat_signal("2-2 reversal", "bearish", current, previous))
+
+    return signals
+
+
+def strat_signal(
+    pattern: str,
+    side: PatternSide,
+    current: Candle,
+    previous: Candle,
+) -> StratSignal:
+    if side == "bullish":
+        trigger_price = previous.high
+        stop_price = previous.low
+    else:
+        trigger_price = previous.low
+        stop_price = previous.high
+
+    return StratSignal(
+        symbol=current.symbol,
+        side=side,
+        pattern=pattern,
+        trigger_price=trigger_price,
+        stop_price=stop_price,
+        formed_at=current.opened_at,
+    )
+
+
+def latest_strat_signal(signals: list[StratSignal], side: PatternSide) -> StratSignal | None:
+    for signal in reversed(signals):
+        if signal.side == side:
+            return signal
+    return None
+
+
+def timeframe_continuity_bias(candles: list[Candle]) -> SignalSide:
+    if len(candles) < 3:
+        return "WAIT"
+
+    recent = candles[-3:]
+    bullish = sum(candle.close > candle.open for candle in recent)
+    bearish = sum(candle.close < candle.open for candle in recent)
+    if bullish == len(recent):
+        return "LONG"
+    if bearish == len(recent):
+        return "SHORT"
+    return "WAIT"
+
+
+def describe_active_patterns(candles: list[Candle]) -> list[str]:
+    gaps = detect_fair_value_gaps(candles)
+    sweeps = detect_liquidity_sweeps(candles)
+    strat = detect_strat_signals(candles)
+    descriptions: list[str] = []
+
+    for side in ("bullish", "bearish"):
+        gap = latest_active_gap(gaps, side)
+        if gap:
+            descriptions.append(
+                f"{side} FVG {gap.lower_bound:.2f}-{gap.upper_bound:.2f}"
+            )
+
+        sweep = latest_sweep(sweeps, side)
+        if sweep:
+            operator = ">" if side == "bullish" else "<"
+            descriptions.append(
+                f"{side} liquidity sweep {sweep.sweep_price:.2f} CHOCH{operator}{sweep.choch_level:.2f}"
+            )
+
+        strat_signal_value = latest_strat_signal(strat, side)
+        if strat_signal_value:
+            descriptions.append(
+                f"{side} Strat {strat_signal_value.pattern} trigger={strat_signal_value.trigger_price:.2f}"
+            )
+
+    return descriptions
+
+
+def unique_reasons(reasons: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for reason in reasons:
+        if reason in seen:
+            continue
+        seen.add(reason)
+        unique.append(reason)
+    return unique
+
+
+def is_regular_market_open(now: datetime) -> bool:
+    eastern_now = now.astimezone(EASTERN)
+    if eastern_now.weekday() >= 5:
+        return False
+
+    return MARKET_OPEN <= eastern_now.time() <= MARKET_CLOSE
+
+
+def fetch_yahoo_quotes(symbols: list[str]) -> list[Quote]:
+    query = urlencode({"symbols": ",".join(symbols)})
+    url = f"https://query1.finance.yahoo.com/v7/finance/quote?{query}"
+    request = Request(url, headers={"User-Agent": "QuackQuant paper monitor"})
+
+    with urlopen(request, timeout=10) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+
+    observed_at = datetime.now(tz=EASTERN)
+    quotes: list[Quote] = []
+    for item in payload["quoteResponse"]["result"]:
+        price = item.get("regularMarketPrice")
+        symbol = item.get("symbol")
+        if symbol and price is not None:
+            quotes.append(Quote(symbol=symbol, price=float(price), observed_at=observed_at))
+
+    return quotes
+
+
+def fetch_yahoo_5m_candles(symbol: str) -> list[Candle]:
+    url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+        "?range=5d&interval=5m&includePrePost=false"
+    )
+    request = Request(url, headers={"User-Agent": "QuackQuant paper monitor"})
+
+    with urlopen(request, timeout=10) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+
+    result = payload["chart"]["result"][0]
+    timestamps = result["timestamp"]
+    quote = result["indicators"]["quote"][0]
+
+    candles: list[Candle] = []
+    for index, timestamp in enumerate(timestamps):
+        opened_at = datetime.fromtimestamp(timestamp, tz=EASTERN)
+        candle_open = quote["open"][index]
+        high = quote["high"][index]
+        low = quote["low"][index]
+        close = quote["close"][index]
+        volume = quote["volume"][index]
+        if None in (candle_open, high, low, close):
+            continue
+        candles.append(
+            Candle(
+                symbol=symbol,
+                opened_at=opened_at,
+                open=float(candle_open),
+                high=float(high),
+                low=float(low),
+                close=float(close),
+                volume=float(volume or 0),
+            )
+        )
+
+    return candles
+
+
+def aggregate_checkpoint_candles(candles: list[Candle], checkpoint_minutes: int) -> list[Candle]:
+    buckets: dict[datetime, list[Candle]] = {}
+    for candle in candles:
+        if not is_regular_market_open(candle.opened_at):
+            continue
+
+        market_open = candle.opened_at.replace(hour=9, minute=30, second=0, microsecond=0)
+        minutes_from_open = int((candle.opened_at - market_open).total_seconds() // 60)
+        if minutes_from_open < 0:
+            continue
+
+        bucket_start = market_open + timedelta(
+            minutes=(minutes_from_open // checkpoint_minutes) * checkpoint_minutes
+        )
+        buckets.setdefault(bucket_start, []).append(candle)
+
+    checkpoint_candles: list[Candle] = []
+    for opened_at, bucket_candles in sorted(buckets.items()):
+        checkpoint_candles.append(
+            Candle(
+                symbol=bucket_candles[0].symbol,
+                opened_at=opened_at,
+                open=bucket_candles[0].open,
+                high=max(candle.high for candle in bucket_candles),
+                low=min(candle.low for candle in bucket_candles),
+                close=bucket_candles[-1].close,
+                volume=sum(candle.volume for candle in bucket_candles),
+            )
+        )
+
+    return checkpoint_candles
+
+
+def infer_market_bias(signals: list[SetupSignal]) -> SignalSide:
+    long_votes = sum(signal.confidence for signal in signals if signal.side == "LONG")
+    short_votes = sum(signal.confidence for signal in signals if signal.side == "SHORT")
+    if long_votes >= short_votes + 20:
+        return "LONG"
+    if short_votes >= long_votes + 20:
+        return "SHORT"
+    return "WAIT"
+
+
+def parse_symbols(raw_symbols: str, watchlist_path: str | None) -> list[str]:
+    symbols = [symbol.strip().upper() for symbol in raw_symbols.split(",") if symbol.strip()]
+    if watchlist_path:
+        with open(watchlist_path) as watchlist:
+            symbols.extend(line.strip().upper() for line in watchlist if line.strip())
+
+    return sorted(set(symbols))
+
+
+def format_signal(signal: SetupSignal) -> str:
+    entry = f"{signal.entry_price:.2f}" if signal.entry_price else "-"
+    stop = f"{signal.stop_price:.2f}" if signal.stop_price else "-"
+    target_1 = f"{signal.target_1_price:.2f}" if signal.target_1_price else "-"
+    target_2 = f"{signal.target_2_price:.2f}" if signal.target_2_price else "-"
+    reasons = "; ".join(signal.reasons[:4])
+    warnings = f" warnings={'; '.join(signal.warnings)}" if signal.warnings else ""
+    return (
+        f"{signal.observed_at.isoformat()} {signal.symbol:<5} ${signal.price:>9.2f} "
+        f"{signal.side:<5} {signal.setup:<17} score={signal.confidence:>3} "
+        f"grade={signal.grade:<8} entry={entry:<8} stop={stop:<8} "
+        f"t1={target_1:<8} t2={target_2:<8} R:R={signal.reward_to_risk:.2f} "
+        f"{reasons}{warnings}"
+    )
+
+
+def format_pattern_summary(symbol: str, checkpoint_candles: list[Candle]) -> str:
+    gaps = detect_fair_value_gaps(checkpoint_candles)
+    sweeps = detect_liquidity_sweeps(checkpoint_candles)
+    bullish_gap = latest_active_gap(gaps, "bullish")
+    bearish_gap = latest_active_gap(gaps, "bearish")
+    bullish_sweep = latest_sweep(sweeps, "bullish")
+    bearish_sweep = latest_sweep(sweeps, "bearish")
+
+    parts: list[str] = []
+    if bullish_gap:
+        parts.append(f"bullish_fvg={bullish_gap.lower_bound:.2f}-{bullish_gap.upper_bound:.2f}")
+    if bearish_gap:
+        parts.append(f"bearish_fvg={bearish_gap.lower_bound:.2f}-{bearish_gap.upper_bound:.2f}")
+    if bullish_sweep:
+        parts.append(
+            f"bullish_sweep={bullish_sweep.sweep_price:.2f} choch>{bullish_sweep.choch_level:.2f}"
+        )
+    if bearish_sweep:
+        parts.append(
+            f"bearish_sweep={bearish_sweep.sweep_price:.2f} choch<{bearish_sweep.choch_level:.2f}"
+        )
+
+    return f"{symbol:<5} patterns: " + (", ".join(parts) if parts else "none")
+
+
+def read_journal(journal_path: Path) -> list[dict[str, str]]:
+    if not journal_path.exists():
+        return []
+
+    with journal_path.open(newline="") as file:
+        return list(csv.DictReader(file))
+
+
+def write_journal(journal_path: Path, rows: list[dict[str, str]]) -> None:
+    journal_path.parent.mkdir(parents=True, exist_ok=True)
+    with journal_path.open("w", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=JOURNAL_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def journal_signal_id(signal: SetupSignal) -> str:
+    timestamp = signal.observed_at.strftime("%Y%m%dT%H%M")
+    return f"{timestamp}-{signal.symbol}-{signal.side}-{signal.setup}-{signal.grade}"
+
+
+def signal_to_journal_row(signal: SetupSignal) -> dict[str, str]:
+    return {
+        "id": journal_signal_id(signal),
+        "opened_at": signal.observed_at.isoformat(),
+        "closed_at": "",
+        "symbol": signal.symbol,
+        "side": signal.side,
+        "setup": signal.setup,
+        "grade": signal.grade,
+        "confidence": str(signal.confidence),
+        "entry_price": format_optional_price(signal.entry_price),
+        "stop_price": format_optional_price(signal.stop_price),
+        "target_1_price": format_optional_price(signal.target_1_price),
+        "target_2_price": format_optional_price(signal.target_2_price),
+        "last_price": f"{signal.price:.2f}",
+        "status": "OPEN",
+        "result_pct": "0.000",
+        "reasons": " | ".join(signal.reasons[:6]),
+    }
+
+
+def format_optional_price(price: float | None) -> str:
+    return f"{price:.2f}" if price is not None else ""
+
+
+def has_open_trade(rows: list[dict[str, str]], signal: SetupSignal) -> bool:
+    return any(
+        row.get("status") == "OPEN"
+        and row.get("symbol") == signal.symbol
+        and row.get("side") == signal.side
+        for row in rows
+    )
+
+
+def has_recent_trade(rows: list[dict[str, str]], signal: SetupSignal) -> bool:
+    for row in rows:
+        if row.get("symbol") != signal.symbol or row.get("side") != signal.side:
+            continue
+
+        opened_at = datetime.fromisoformat(row["opened_at"])
+        if signal.observed_at - opened_at <= timedelta(minutes=JOURNAL_COOLDOWN_MINUTES):
+            return True
+
+    return False
+
+
+def update_trade_status(row: dict[str, str], current_price: float, observed_at: datetime) -> None:
+    if row.get("status") != "OPEN":
+        return
+
+    side = row["side"]
+    entry_price = float(row["entry_price"])
+    stop_price = float(row["stop_price"])
+    target_1_price = float(row["target_1_price"])
+    target_2_price = float(row["target_2_price"])
+    row["last_price"] = f"{current_price:.2f}"
+
+    status = "OPEN"
+    if side == "LONG":
+        if current_price <= stop_price:
+            status = "STOPPED"
+        elif current_price >= target_2_price:
+            status = "TARGET_2"
+        elif current_price >= target_1_price:
+            status = "TARGET_1"
+        result_pct = ((current_price - entry_price) / entry_price) * 100
+    else:
+        if current_price >= stop_price:
+            status = "STOPPED"
+        elif current_price <= target_2_price:
+            status = "TARGET_2"
+        elif current_price <= target_1_price:
+            status = "TARGET_1"
+        result_pct = ((entry_price - current_price) / entry_price) * 100
+
+    row["result_pct"] = f"{result_pct:.3f}"
+    if status != "OPEN":
+        row["status"] = status
+        row["closed_at"] = observed_at.isoformat()
+
+
+def update_journal(journal_path: Path, signals: list[SetupSignal]) -> dict[str, int]:
+    rows = read_journal(journal_path)
+    latest_prices = {signal.symbol: signal.price for signal in signals}
+    latest_times = {signal.symbol: signal.observed_at for signal in signals}
+    closed_count = 0
+    added_count = 0
+
+    for row in rows:
+        symbol = row.get("symbol", "")
+        if symbol not in latest_prices or row.get("status") != "OPEN":
+            continue
+
+        previous_status = row["status"]
+        update_trade_status(row, latest_prices[symbol], latest_times[symbol])
+        if row["status"] != previous_status:
+            closed_count += 1
+
+    for signal in signals:
+        if signal.side == "WAIT" or signal.entry_price is None:
+            continue
+        if has_open_trade(rows, signal) or has_recent_trade(rows, signal):
+            continue
+
+        rows.append(signal_to_journal_row(signal))
+        added_count += 1
+
+    write_journal(journal_path, rows)
+    return {"added": added_count, "closed": closed_count, "open": count_open_trades(rows)}
+
+
+def count_open_trades(rows: list[dict[str, str]]) -> int:
+    return sum(row.get("status") == "OPEN" for row in rows)
+
+
+def summarize_journal(journal_path: Path) -> str:
+    rows = read_journal(journal_path)
+    closed = [row for row in rows if row.get("status") in {"TARGET_1", "TARGET_2", "STOPPED"}]
+    winners = [row for row in closed if row.get("status") in {"TARGET_1", "TARGET_2"}]
+    open_count = count_open_trades(rows)
+    win_rate = (len(winners) / len(closed) * 100) if closed else 0
+    avg_result = mean(float(row["result_pct"]) for row in closed) if closed else 0
+    return (
+        f"journal={journal_path} total={len(rows)} open={open_count} closed={len(closed)} "
+        f"wins={len(winners)} win_rate={win_rate:.1f}% avg_result={avg_result:.3f}%"
+    )
+
+
+def run_once(
+    symbols: list[str],
+    checkpoint_minutes: int,
+    strategy: CheckpointConfluenceStrategy,
+) -> list[SetupSignal]:
+    quotes_by_symbol = {quote.symbol: quote for quote in fetch_yahoo_quotes(symbols)}
+    signals: list[SetupSignal] = []
+
+    for symbol in symbols:
+        quote = quotes_by_symbol.get(symbol)
+        checkpoint_candles = aggregate_checkpoint_candles(
+            fetch_yahoo_5m_candles(symbol),
+            checkpoint_minutes=checkpoint_minutes,
+        )
+        if quote is None or len(checkpoint_candles) < 2:
+            continue
+
+        levels = strategy.build_levels(checkpoint_candles[-1], checkpoint_minutes)
+        signals.append(
+            strategy.evaluate(
+                quote=quote,
+                levels=levels,
+                checkpoint_candles=checkpoint_candles,
+            )
+        )
+
+    market_bias = infer_market_bias(
+        [signal for signal in signals if signal.symbol in {"SPY", "QQQ"}]
+    )
+    if market_bias == "WAIT":
+        return signals
+
+    biased_signals: list[SetupSignal] = []
+    for symbol in symbols:
+        quote = quotes_by_symbol.get(symbol)
+        checkpoint_candles = aggregate_checkpoint_candles(
+            fetch_yahoo_5m_candles(symbol),
+            checkpoint_minutes=checkpoint_minutes,
+        )
+        if quote is None or len(checkpoint_candles) < 2:
+            continue
+
+        levels = strategy.build_levels(checkpoint_candles[-1], checkpoint_minutes)
+        biased_signals.append(
+            strategy.evaluate(
+                quote=quote,
+                levels=levels,
+                checkpoint_candles=checkpoint_candles,
+                market_bias=market_bias,
+            )
+        )
+
+    return biased_signals
+
+
+def run_live_monitor() -> None:
+    parser = argparse.ArgumentParser(description="QuackQuant paper-only setup scanner")
+    parser.add_argument(
+        "--symbols",
+        default=os.getenv("QUACKQUANT_SYMBOLS", "SPY,QQQ"),
+        help="Comma-separated symbols, for example SPY,QQQ,AAPL,NVDA",
+    )
+    parser.add_argument("--watchlist", default=os.getenv("QUACKQUANT_WATCHLIST"))
+    parser.add_argument(
+        "--checkpoint-minutes",
+        type=int,
+        choices=(30, 60),
+        default=int(os.getenv("QUACKQUANT_CHECKPOINT_MINUTES", "60")),
+    )
+    parser.add_argument(
+        "--poll-seconds",
+        type=int,
+        default=int(os.getenv("QUACKQUANT_POLL_SECONDS", "300")),
+    )
+    parser.add_argument(
+        "--journal",
+        type=Path,
+        default=Path(os.getenv("QUACKQUANT_JOURNAL", DEFAULT_JOURNAL_PATH)),
+        help="CSV paper-trade journal path",
+    )
+    parser.add_argument("--no-journal", action="store_true", help="Disable paper journal updates")
+    parser.add_argument("--journal-summary", action="store_true", help="Print journal summary and exit")
+    parser.add_argument("--once", action="store_true")
+    args = parser.parse_args()
+
+    if args.journal_summary:
+        print(summarize_journal(args.journal))
+        return
+
+    symbols = parse_symbols(args.symbols, args.watchlist)
+    strategy = CheckpointConfluenceStrategy(
+        risk_pct=float(os.getenv("QUACKQUANT_RISK_PCT", "0.15")),
+        target_1_pct=float(os.getenv("QUACKQUANT_TARGET_1_PCT", "0.30")),
+        target_2_pct=float(os.getenv("QUACKQUANT_TARGET_2_PCT", "0.45")),
+        zone_width_pct=float(os.getenv("QUACKQUANT_ZONE_WIDTH_PCT", "0.03")),
+        breakout_buffer_pct=float(os.getenv("QUACKQUANT_BREAKOUT_BUFFER_PCT", "0.02")),
+    )
+
+    print("QuackQuant confluence setup scanner")
+    print(
+        f"symbols={symbols} checkpoint={args.checkpoint_minutes}m "
+        f"risk={strategy.risk_pct}% t1={strategy.target_1_pct}% "
+        f"t2={strategy.target_2_pct}% R:R={strategy.reward_to_risk:.2f}"
+    )
+    print("Paper-only: prints signals, entries, stops, and targets. It never places trades.")
+
+    while True:
+        now = datetime.now(tz=EASTERN)
+        if not is_regular_market_open(now):
+            print(f"{now.isoformat()} market not open; waiting {args.poll_seconds}s")
+            if args.once:
+                return
+            time.sleep(args.poll_seconds)
+            continue
+
+        signals = run_once(
+            symbols=symbols,
+            checkpoint_minutes=args.checkpoint_minutes,
+            strategy=strategy,
+        )
+        for signal in sorted(signals, key=lambda item: item.confidence, reverse=True):
+            print(format_signal(signal))
+
+        if not args.no_journal:
+            journal_stats = update_journal(args.journal, signals)
+            print(
+                f"journal updated: added={journal_stats['added']} "
+                f"closed={journal_stats['closed']} open={journal_stats['open']} "
+                f"path={args.journal}"
+            )
+
+        if args.once:
+            return
+        time.sleep(args.poll_seconds)
+
+
+def test_strategy_generates_high_confidence_long_breakout() -> None:
+    strategy = CheckpointConfluenceStrategy(risk_pct=0.15, target_1_pct=0.30)
+    observed_at = datetime(2026, 7, 17, 11, 30, tzinfo=EASTERN)
+    candles = [
+        Candle("SPY", observed_at - timedelta(minutes=180), 498, 499, 497, 498.5, 100),
+        Candle("SPY", observed_at - timedelta(minutes=120), 498.5, 500, 498, 499.8, 110),
+        Candle("SPY", observed_at - timedelta(minutes=60), 499.8, 501, 499.5, 500.8, 120),
+        Candle("SPY", observed_at, 500.8, 502, 500.7, 501.8, 200),
+    ]
+    levels = strategy.build_levels(candles[-1], checkpoint_minutes=60)
+
+    signal = strategy.evaluate(Quote("SPY", 502.12, observed_at), levels, candles)
+
+    assert signal.side == "LONG"
+    assert signal.grade == "A"
+    assert signal.confidence >= 80
+    assert round(signal.stop_price or 0, 2) == 501.37
+    assert round(signal.target_1_price or 0, 2) == 503.63
+
+
+def test_strategy_generates_high_confidence_short_breakdown() -> None:
+    strategy = CheckpointConfluenceStrategy(risk_pct=0.15, target_1_pct=0.30)
+    observed_at = datetime(2026, 7, 17, 11, 30, tzinfo=EASTERN)
+    candles = [
+        Candle("QQQ", observed_at - timedelta(minutes=180), 402, 403, 401, 401.5, 100),
+        Candle("QQQ", observed_at - timedelta(minutes=120), 401.5, 402, 400, 400.2, 110),
+        Candle("QQQ", observed_at - timedelta(minutes=60), 400.2, 400.5, 399, 399.3, 120),
+        Candle("QQQ", observed_at, 399.3, 399.5, 397.9, 398.1, 200),
+    ]
+    levels = strategy.build_levels(candles[-1], checkpoint_minutes=60)
+
+    signal = strategy.evaluate(Quote("QQQ", 397.80, observed_at), levels, candles)
+
+    assert signal.side == "SHORT"
+    assert signal.grade == "A"
+    assert signal.confidence >= 80
+    assert round(signal.stop_price or 0, 2) == 398.40
+    assert round(signal.target_1_price or 0, 2) == 396.61
+
+
+def test_strategy_waits_when_price_is_choppy() -> None:
+    strategy = CheckpointConfluenceStrategy()
+    observed_at = datetime(2026, 7, 17, 11, 30, tzinfo=EASTERN)
+    candles = [
+        Candle("AAPL", observed_at - timedelta(minutes=180), 200, 201, 199, 200.2, 100),
+        Candle("AAPL", observed_at - timedelta(minutes=120), 200.2, 201, 199.5, 200.0, 90),
+        Candle("AAPL", observed_at - timedelta(minutes=60), 200.0, 200.8, 199.4, 200.1, 80),
+        Candle("AAPL", observed_at, 200.1, 200.7, 199.6, 200.05, 70),
+    ]
+    levels = strategy.build_levels(candles[-1], checkpoint_minutes=60)
+
+    signal = strategy.evaluate(Quote("AAPL", 200.08, observed_at), levels, candles)
+
+    assert signal.side == "WAIT"
+    assert signal.grade == "NO_TRADE"
+    assert signal.entry_price is None
+
+
+def test_detects_bullish_and_bearish_fair_value_gaps() -> None:
+    observed_at = datetime(2026, 7, 17, 10, 0, tzinfo=EASTERN)
+    candles = [
+        Candle("SPY", observed_at, 100, 101, 99, 100.5, 100),
+        Candle("SPY", observed_at + timedelta(minutes=5), 100.5, 104, 100.4, 103.8, 200),
+        Candle("SPY", observed_at + timedelta(minutes=10), 103.8, 105, 102, 104.8, 180),
+        Candle("SPY", observed_at + timedelta(minutes=15), 104.8, 105, 104, 104.5, 120),
+        Candle("SPY", observed_at + timedelta(minutes=20), 104.5, 104.6, 98, 98.5, 250),
+        Candle("SPY", observed_at + timedelta(minutes=25), 98.5, 99, 97, 97.5, 220),
+    ]
+
+    gaps = detect_fair_value_gaps(candles, min_gap_pct=0.03)
+
+    assert any(gap.side == "bullish" and gap.lower_bound == 101 for gap in gaps)
+    assert any(gap.side == "bearish" and gap.upper_bound == 104 for gap in gaps)
+
+
+def test_detects_bullish_liquidity_sweep_with_choch() -> None:
+    observed_at = datetime(2026, 7, 17, 10, 0, tzinfo=EASTERN)
+    candles = [
+        Candle("QQQ", observed_at, 100, 101, 99, 100.5, 100),
+        Candle("QQQ", observed_at + timedelta(minutes=5), 100.5, 101.2, 99.02, 100.8, 100),
+        Candle("QQQ", observed_at + timedelta(minutes=10), 100.8, 101.1, 99.01, 100.7, 100),
+        Candle("QQQ", observed_at + timedelta(minutes=15), 100.7, 101.0, 99.03, 100.6, 100),
+        Candle("QQQ", observed_at + timedelta(minutes=20), 100.6, 101.5, 98.7, 101.45, 220),
+    ]
+
+    sweeps = detect_liquidity_sweeps(candles, lookback=4)
+
+    assert len(sweeps) == 1
+    assert sweeps[0].side == "bullish"
+    assert sweeps[0].sweep_price == 98.7
+
+
+def test_detects_bearish_liquidity_sweep_with_choch() -> None:
+    observed_at = datetime(2026, 7, 17, 10, 0, tzinfo=EASTERN)
+    candles = [
+        Candle("QQQ", observed_at, 100, 101, 99, 100.5, 100),
+        Candle("QQQ", observed_at + timedelta(minutes=5), 100.5, 100.98, 98.9, 99.6, 100),
+        Candle("QQQ", observed_at + timedelta(minutes=10), 99.6, 100.99, 98.8, 99.5, 100),
+        Candle("QQQ", observed_at + timedelta(minutes=15), 99.5, 100.97, 98.7, 99.2, 100),
+        Candle("QQQ", observed_at + timedelta(minutes=20), 99.2, 101.4, 98.4, 98.5, 220),
+    ]
+
+    sweeps = detect_liquidity_sweeps(candles, lookback=4)
+
+    assert len(sweeps) == 1
+    assert sweeps[0].side == "bearish"
+    assert sweeps[0].sweep_price == 101.4
+
+
+def test_fvg_and_sweep_add_long_confluence_score() -> None:
+    strategy = CheckpointConfluenceStrategy(risk_pct=0.15, target_1_pct=0.30)
+    observed_at = datetime(2026, 7, 17, 11, 30, tzinfo=EASTERN)
+    candles = [
+        Candle("SPY", observed_at - timedelta(minutes=300), 99.8, 100.0, 99.0, 99.5, 100),
+        Candle("SPY", observed_at - timedelta(minutes=240), 99.5, 100.1, 99.0, 99.7, 110),
+        Candle("SPY", observed_at - timedelta(minutes=180), 99.7, 100.2, 99.0, 99.8, 110),
+        Candle("SPY", observed_at - timedelta(minutes=120), 99.8, 101.6, 99.0, 101.5, 180),
+        Candle("SPY", observed_at - timedelta(minutes=60), 101.5, 103.0, 98.7, 103.0, 280),
+        Candle("SPY", observed_at, 102.8, 104.2, 102.5, 104.0, 300),
+    ]
+    levels = strategy.build_levels(candles[-1], checkpoint_minutes=60)
+
+    signal = strategy.evaluate(Quote("SPY", 104.25, observed_at), levels, candles)
+
+    assert signal.side == "LONG"
+    assert any("bullish FVG" in reason for reason in signal.reasons)
+    assert any("bullish liquidity sweep" in reason for reason in signal.reasons)
+
+
+def test_classifies_strat_candle_scenarios() -> None:
+    previous = Candle("SPY", datetime(2026, 7, 17, 9, 30, tzinfo=EASTERN), 100, 101, 99, 100)
+
+    assert classify_strat_scenario(
+        Candle("SPY", datetime(2026, 7, 17, 10, 0, tzinfo=EASTERN), 100, 100.8, 99.2, 100),
+        previous,
+    ) == "1"
+    assert classify_strat_scenario(
+        Candle("SPY", datetime(2026, 7, 17, 10, 0, tzinfo=EASTERN), 100, 102, 99.2, 101.5),
+        previous,
+    ) == "2U"
+    assert classify_strat_scenario(
+        Candle("SPY", datetime(2026, 7, 17, 10, 0, tzinfo=EASTERN), 100, 100.8, 98, 98.5),
+        previous,
+    ) == "2D"
+    assert classify_strat_scenario(
+        Candle("SPY", datetime(2026, 7, 17, 10, 0, tzinfo=EASTERN), 100, 102, 98, 101),
+        previous,
+    ) == "3"
+
+
+def test_detects_bullish_strat_212_reversal() -> None:
+    observed_at = datetime(2026, 7, 17, 9, 30, tzinfo=EASTERN)
+    candles = [
+        Candle("SPY", observed_at, 100, 101, 99, 100, 100),
+        Candle("SPY", observed_at + timedelta(minutes=30), 100, 100.5, 98, 98.5, 120),
+        Candle("SPY", observed_at + timedelta(minutes=60), 98.5, 100.2, 98.2, 99.5, 80),
+        Candle("SPY", observed_at + timedelta(minutes=90), 99.5, 101, 98.4, 100.8, 150),
+    ]
+
+    signals = detect_strat_signals(candles)
+
+    assert signals[-1].side == "bullish"
+    assert signals[-1].pattern == "2-1-2 reversal"
+    assert signals[-1].trigger_price == 100.2
+    assert signals[-1].stop_price == 98.2
+
+
+def test_timeframe_continuity_bias() -> None:
+    observed_at = datetime(2026, 7, 17, 9, 30, tzinfo=EASTERN)
+    bullish = [
+        Candle("SPY", observed_at, 100, 101, 99, 100.5),
+        Candle("SPY", observed_at + timedelta(minutes=30), 100.5, 102, 100, 101.5),
+        Candle("SPY", observed_at + timedelta(minutes=60), 101.5, 103, 101, 102.5),
+    ]
+    mixed = [
+        Candle("SPY", observed_at, 100, 101, 99, 100.5),
+        Candle("SPY", observed_at + timedelta(minutes=30), 100.5, 102, 100, 100.2),
+        Candle("SPY", observed_at + timedelta(minutes=60), 100.2, 101, 99, 100.8),
+    ]
+
+    assert timeframe_continuity_bias(bullish) == "LONG"
+    assert timeframe_continuity_bias(mixed) == "WAIT"
+
+
+def test_journal_records_and_closes_long_target() -> None:
+    journal_path = Path(tempfile.mkdtemp()) / "journal.csv"
+    observed_at = datetime(2026, 7, 17, 10, 0, tzinfo=EASTERN)
+    signal = SetupSignal(
+        symbol="SPY",
+        side="LONG",
+        setup="breakout",
+        confidence=85,
+        grade="A",
+        price=100,
+        entry_price=100,
+        stop_price=99,
+        target_1_price=101,
+        target_2_price=102,
+        risk_pct=1,
+        target_1_pct=1,
+        target_2_pct=2,
+        reward_to_risk=1,
+        reasons=["test"],
+        warnings=[],
+        observed_at=observed_at,
+    )
+
+    first_stats = update_journal(journal_path, [signal])
+    second_stats = update_journal(
+        journal_path,
+        [
+            SetupSignal(
+                **{
+                    **signal.__dict__,
+                    "price": 101.5,
+                    "observed_at": observed_at + timedelta(minutes=30),
+                }
+            )
+        ],
+    )
+    rows = read_journal(journal_path)
+
+    assert first_stats == {"added": 1, "closed": 0, "open": 1}
+    assert second_stats == {"added": 0, "closed": 1, "open": 0}
+    assert rows[0]["status"] == "TARGET_1"
+    assert rows[0]["result_pct"] == "1.500"
+
+
+def test_journal_records_and_closes_short_stop() -> None:
+    journal_path = Path(tempfile.mkdtemp()) / "journal.csv"
+    observed_at = datetime(2026, 7, 17, 10, 0, tzinfo=EASTERN)
+    signal = SetupSignal(
+        symbol="QQQ",
+        side="SHORT",
+        setup="breakout",
+        confidence=85,
+        grade="A",
+        price=100,
+        entry_price=100,
+        stop_price=101,
+        target_1_price=99,
+        target_2_price=98,
+        risk_pct=1,
+        target_1_pct=1,
+        target_2_pct=2,
+        reward_to_risk=1,
+        reasons=["test"],
+        warnings=[],
+        observed_at=observed_at,
+    )
+
+    update_journal(journal_path, [signal])
+    update_journal(
+        journal_path,
+        [
+            SetupSignal(
+                **{
+                    **signal.__dict__,
+                    "price": 101.2,
+                    "observed_at": observed_at + timedelta(minutes=30),
+                }
+            )
+        ],
+    )
+    rows = read_journal(journal_path)
+
+    assert rows[0]["status"] == "STOPPED"
+    assert rows[0]["result_pct"] == "-1.200"
+
+
+def test_aggregate_checkpoint_candles_from_5m_data() -> None:
+    candles = [
+        Candle("SPY", datetime(2026, 7, 17, 9, 30, tzinfo=EASTERN), 500, 501, 499, 500.5, 10),
+        Candle("SPY", datetime(2026, 7, 17, 9, 35, tzinfo=EASTERN), 500.5, 502, 500, 501, 20),
+        Candle("SPY", datetime(2026, 7, 17, 10, 0, tzinfo=EASTERN), 501, 503, 500, 502, 30),
+    ]
+
+    checkpoint = aggregate_checkpoint_candles(candles, checkpoint_minutes=30)
+
+    assert len(checkpoint) == 2
+    assert checkpoint[0].open == 500
+    assert checkpoint[0].high == 502
+    assert checkpoint[0].low == 499
+    assert checkpoint[0].close == 501
+    assert checkpoint[0].volume == 30
+
+
+def test_parse_symbols_deduplicates_and_normalizes() -> None:
+    assert parse_symbols("spy, qqq,SPY,AAPL", None) == ["AAPL", "QQQ", "SPY"]
+
+
+def test_regular_market_open_window() -> None:
+    assert is_regular_market_open(datetime(2026, 7, 17, 9, 30, tzinfo=EASTERN))
+    assert is_regular_market_open(datetime(2026, 7, 17, 16, 0, tzinfo=EASTERN))
+    assert not is_regular_market_open(datetime(2026, 7, 17, 8, 0, tzinfo=EASTERN))
+    assert not is_regular_market_open(datetime(2026, 7, 18, 10, 0, tzinfo=EASTERN))
+
+
+if __name__ == "__main__":
+    run_live_monitor()

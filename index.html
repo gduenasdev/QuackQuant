@@ -5,67 +5,287 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       name="description"
-      content="QuantQuack — an autonomous trading agent, currently in development."
+      content="QuackQuant scanner dashboard for paper-trading strategy signals."
     />
-    <meta name="theme-color" content="#f4f0e7" />
-    <title>QuantQuack — Trading intelligence is hatching</title>
+    <meta name="theme-color" content="#f6f4ee" />
+    <title>QuackQuant Scanner</title>
     <link rel="icon" href="images/QuackQuantLogo.png" type="image/png" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700&display=swap"
+      href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Inter:wght@400;500;600;700&display=swap"
       rel="stylesheet"
     />
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
-    <header class="site-header">
-      <a class="brand" href="/" aria-label="QuantQuack home">
+    <header class="app-header">
+      <a class="brand" href="/" aria-label="QuackQuant scanner">
         <span class="brand-mark">
           <img src="images/QuackQuantLogo.png" alt="" />
         </span>
-        <span>QuantQuack</span>
+        <span>
+          <strong>QuackQuant</strong>
+          <small>Paper Scanner</small>
+        </span>
       </a>
-      <span class="status"><i aria-hidden="true"></i> In development</span>
+      <div class="session-state">
+        <span id="api-state" class="state-pill">Idle</span>
+        <span id="clock" class="clock">--:--</span>
+      </div>
     </header>
 
-    <main>
-      <section class="hero" aria-labelledby="hero-title">
-        <div class="market-grid" aria-hidden="true"></div>
-        <div class="hero-copy">
-          <p class="eyebrow">Autonomous market intelligence</p>
-          <h1 id="hero-title">Something smart<br />is <em>hatching.</em></h1>
-          <p class="intro">
-            QuantQuack is a trading agent in the making—built to watch the
-            markets, find the signal, and act with discipline.
-          </p>
-          <div class="coming-soon">
-            <span>01</span>
+    <main class="workspace">
+      <section class="control-panel" aria-label="Scanner controls">
+        <div>
+          <label for="symbols">Watchlist</label>
+          <input id="symbols" value="SPY,QQQ,AAPL,NVDA" autocomplete="off" />
+        </div>
+        <div>
+          <label for="checkpoint">Checkpoint</label>
+          <select id="checkpoint">
+            <option value="30">30 minutes</option>
+            <option value="60">60 minutes</option>
+          </select>
+        </div>
+        <label class="toggle">
+          <input id="record" type="checkbox" checked />
+          <span>Record calls</span>
+        </label>
+        <div class="actions">
+          <button id="scan" type="button">Scan Now</button>
+          <button id="auto" type="button" class="secondary">Auto Off</button>
+        </div>
+      </section>
+
+      <section class="metrics" aria-label="Journal summary">
+        <div>
+          <span>Signals</span>
+          <strong id="metric-signals">0</strong>
+        </div>
+        <div>
+          <span>A Setups</span>
+          <strong id="metric-a">0</strong>
+        </div>
+        <div>
+          <span>Open Calls</span>
+          <strong id="metric-open">0</strong>
+        </div>
+        <div>
+          <span>Last Scan</span>
+          <strong id="metric-time">--</strong>
+        </div>
+      </section>
+
+      <section class="scanner-grid">
+        <div class="panel signals-panel">
+          <div class="panel-header">
             <div>
-              <strong>Agent deploying soon</strong>
-              <p>Research and development underway.</p>
+              <h1>Live Scanner</h1>
+              <p>Strat, FVG, liquidity sweep, CHOCH, volume, and trend confluence.</p>
             </div>
+            <span class="paper-badge">Paper only</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Symbol</th>
+                  <th>Side</th>
+                  <th>Grade</th>
+                  <th>Score</th>
+                  <th>Entry</th>
+                  <th>Stop</th>
+                  <th>T1</th>
+                  <th>T2</th>
+                  <th>Reason</th>
+                </tr>
+              </thead>
+              <tbody id="signals-body">
+                <tr>
+                  <td colspan="9" class="empty">Run a scan to load current setups.</td>
+                </tr>
+              </tbody>
+            </table>
           </div>
         </div>
 
-        <div class="hero-art" aria-hidden="true">
-          <div class="orbit orbit-one"></div>
-          <div class="orbit orbit-two"></div>
-          <div class="logo-stage">
-            <img src="images/QuackQuantLogo.png" alt="" />
+        <aside class="panel journal-panel">
+          <div class="panel-header compact">
+            <div>
+              <h2>Paper Journal</h2>
+              <p id="journal-summary">No journal loaded.</p>
+            </div>
+            <button id="refresh-journal" type="button" class="secondary small">Refresh</button>
           </div>
-          <div class="quote-chip">QQ <span>///</span> ALPHA</div>
-        </div>
+          <div id="journal-list" class="journal-list">
+            <p class="empty">Recorded LONG/SHORT calls will appear here.</p>
+          </div>
+        </aside>
       </section>
     </main>
 
-    <footer>
-      <span>© <span id="year">2026</span> QuantQuack</span>
-      <span>Signal over noise.</span>
-    </footer>
-
     <script>
-      document.getElementById("year").textContent = new Date().getFullYear();
+      const apiBase =
+        location.port === "8000" || location.protocol === "file:"
+          ? "http://127.0.0.1:8001/api/v1"
+          : "/api/v1";
+      const els = {
+        apiState: document.getElementById("api-state"),
+        clock: document.getElementById("clock"),
+        symbols: document.getElementById("symbols"),
+        checkpoint: document.getElementById("checkpoint"),
+        record: document.getElementById("record"),
+        scan: document.getElementById("scan"),
+        auto: document.getElementById("auto"),
+        signalsBody: document.getElementById("signals-body"),
+        metricSignals: document.getElementById("metric-signals"),
+        metricA: document.getElementById("metric-a"),
+        metricOpen: document.getElementById("metric-open"),
+        metricTime: document.getElementById("metric-time"),
+        journalSummary: document.getElementById("journal-summary"),
+        journalList: document.getElementById("journal-list"),
+        refreshJournal: document.getElementById("refresh-journal"),
+      };
+      let autoTimer = null;
+
+      function setState(text, tone = "idle") {
+        els.apiState.textContent = text;
+        els.apiState.dataset.tone = tone;
+      }
+
+      function money(value) {
+        return value === null || value === undefined ? "-" : Number(value).toFixed(2);
+      }
+
+      function renderSignals(signals) {
+        els.metricSignals.textContent = signals.length;
+        els.metricA.textContent = signals.filter((signal) => signal.grade === "A").length;
+        els.metricTime.textContent = new Date().toLocaleTimeString([], {
+          hour: "numeric",
+          minute: "2-digit",
+        });
+
+        if (!signals.length) {
+          els.signalsBody.innerHTML =
+            '<tr><td colspan="9" class="empty">No symbols returned data.</td></tr>';
+          return;
+        }
+
+        els.signalsBody.innerHTML = signals
+          .sort((a, b) => b.confidence - a.confidence)
+          .map((signal) => {
+            const reason = (signal.reasons || []).slice(0, 3).join("; ");
+            return `
+              <tr>
+                <td><strong>${signal.symbol}</strong></td>
+                <td><span class="side ${signal.side.toLowerCase()}">${signal.side}</span></td>
+                <td><span class="grade">${signal.grade}</span></td>
+                <td>${signal.confidence}</td>
+                <td>${money(signal.entry_price)}</td>
+                <td>${money(signal.stop_price)}</td>
+                <td>${money(signal.target_1_price)}</td>
+                <td>${money(signal.target_2_price)}</td>
+                <td class="reason">${reason || "No active setup."}</td>
+              </tr>
+            `;
+          })
+          .join("");
+      }
+
+      function renderJournal(rows) {
+        const openRows = rows.filter((row) => row.status === "OPEN");
+        els.metricOpen.textContent = openRows.length;
+        if (!rows.length) {
+          els.journalList.innerHTML = '<p class="empty">No recorded calls yet.</p>';
+          return;
+        }
+
+        els.journalList.innerHTML = rows
+          .slice(-12)
+          .reverse()
+          .map(
+            (row) => `
+              <article class="journal-item">
+                <div>
+                  <strong>${row.symbol} ${row.side}</strong>
+                  <span>${row.grade} / ${row.confidence}</span>
+                </div>
+                <div>
+                  <span>${row.status}</span>
+                  <b>${Number(row.result_pct || 0).toFixed(3)}%</b>
+                </div>
+              </article>
+            `,
+          )
+          .join("");
+      }
+
+      async function loadJournal() {
+        const [summaryResponse, journalResponse] = await Promise.all([
+          fetch(`${apiBase}/scanner/journal/summary`),
+          fetch(`${apiBase}/scanner/journal`),
+        ]);
+        if (!summaryResponse.ok || !journalResponse.ok) {
+          throw new Error("Journal API unavailable");
+        }
+        const summary = await summaryResponse.json();
+        const journal = await journalResponse.json();
+        els.journalSummary.textContent = summary.summary;
+        renderJournal(journal.rows || []);
+      }
+
+      async function scan() {
+        setState("Scanning", "busy");
+        els.scan.disabled = true;
+        try {
+          const params = new URLSearchParams({
+            symbols: els.symbols.value,
+            checkpoint_minutes: els.checkpoint.value,
+            record: String(els.record.checked),
+          });
+          const response = await fetch(`${apiBase}/scanner/signals?${params}`);
+          if (!response.ok) {
+            throw new Error(`Scanner API returned ${response.status}`);
+          }
+          const payload = await response.json();
+          renderSignals(payload.signals || []);
+          await loadJournal();
+          setState("Connected", "ok");
+        } catch (error) {
+          setState("API offline", "error");
+          els.signalsBody.innerHTML = `<tr><td colspan="9" class="empty">${error.message}</td></tr>`;
+        } finally {
+          els.scan.disabled = false;
+        }
+      }
+
+      function toggleAuto() {
+        if (autoTimer) {
+          clearInterval(autoTimer);
+          autoTimer = null;
+          els.auto.textContent = "Auto Off";
+          return;
+        }
+        scan();
+        autoTimer = setInterval(scan, 300000);
+        els.auto.textContent = "Auto On";
+      }
+
+      setInterval(() => {
+        els.clock.textContent = new Date().toLocaleTimeString([], {
+          hour: "numeric",
+          minute: "2-digit",
+          second: "2-digit",
+        });
+      }, 1000);
+
+      els.scan.addEventListener("click", scan);
+      els.auto.addEventListener("click", toggleAuto);
+      els.refreshJournal.addEventListener("click", () => {
+        loadJournal().catch(() => setState("API offline", "error"));
+      });
+      loadJournal().catch(() => setState("API offline", "error"));
     </script>
   </body>
 </html>
