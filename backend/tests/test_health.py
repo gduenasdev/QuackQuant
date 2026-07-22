@@ -18,3 +18,9 @@ def test_unimplemented_endpoint_fails_loudly() -> None:
     assert response.status_code == 501
     assert response.json()["detail"]["status"] == "not_implemented"
 
+
+def test_scanner_journal_summary() -> None:
+    response = client.get("/api/v1/scanner/journal/summary")
+
+    assert response.status_code == 200
+    assert "summary" in response.json()

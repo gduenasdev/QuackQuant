@@ -1016,6 +1016,71 @@ def run_once(
     checkpoint_minutes: int,
     strategy: CheckpointConfluenceStrategy,
 ) -> list[SetupSignal]:
+    candles_by_symbol: dict[str, list[Candle]] = {}
+    checkpoints_by_symbol: dict[str, list[Candle]] = {}
+    signals: list[SetupSignal] = []
+
+    for symbol in symbols:
+        raw_candles = fetch_yahoo_5m_candles(symbol)
+        checkpoint_candles = aggregate_checkpoint_candles(
+            raw_candles,
+            checkpoint_minutes=checkpoint_minutes,
+        )
+        candles_by_symbol[symbol] = raw_candles
+        checkpoints_by_symbol[symbol] = checkpoint_candles
+        if not raw_candles or len(checkpoint_candles) < 2:
+            continue
+
+        quote = Quote(
+            symbol=symbol,
+            price=raw_candles[-1].close,
+            observed_at=raw_candles[-1].opened_at,
+        )
+        levels = strategy.build_levels(checkpoint_candles[-1], checkpoint_minutes)
+        signals.append(
+            strategy.evaluate(
+                quote=quote,
+                levels=levels,
+                checkpoint_candles=checkpoint_candles,
+            )
+        )
+
+    market_bias = infer_market_bias(
+        [signal for signal in signals if signal.symbol in {"SPY", "QQQ"}]
+    )
+    if market_bias == "WAIT":
+        return signals
+
+    biased_signals: list[SetupSignal] = []
+    for symbol in symbols:
+        raw_candles = candles_by_symbol.get(symbol, [])
+        checkpoint_candles = checkpoints_by_symbol.get(symbol, [])
+        if not raw_candles or len(checkpoint_candles) < 2:
+            continue
+
+        quote = Quote(
+            symbol=symbol,
+            price=raw_candles[-1].close,
+            observed_at=raw_candles[-1].opened_at,
+        )
+        levels = strategy.build_levels(checkpoint_candles[-1], checkpoint_minutes)
+        biased_signals.append(
+            strategy.evaluate(
+                quote=quote,
+                levels=levels,
+                checkpoint_candles=checkpoint_candles,
+                market_bias=market_bias,
+            )
+        )
+
+    return biased_signals
+
+
+def run_once_using_quote_endpoint(
+    symbols: list[str],
+    checkpoint_minutes: int,
+    strategy: CheckpointConfluenceStrategy,
+) -> list[SetupSignal]:
     quotes_by_symbol = {quote.symbol: quote for quote in fetch_yahoo_quotes(symbols)}
     signals: list[SetupSignal] = []
 

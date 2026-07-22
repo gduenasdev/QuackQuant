@@ -1,7 +1,6 @@
 from dataclasses import asdict
-from typing import Literal
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 
 from app.services.stock_monitor import (
     DEFAULT_JOURNAL_PATH,
@@ -18,9 +17,12 @@ router = APIRouter()
 @router.get("/signals")
 def scanner_signals(
     symbols: str = Query(default="SPY,QQQ", description="Comma-separated ticker symbols"),
-    checkpoint_minutes: Literal[30, 60] = Query(default=30),
+    checkpoint_minutes: int = Query(default=30),
     record: bool = Query(default=True, description="Record LONG/SHORT calls to paper journal"),
 ) -> dict[str, object]:
+    if checkpoint_minutes not in {30, 60}:
+        raise HTTPException(status_code=400, detail="checkpoint_minutes must be 30 or 60")
+
     symbol_list = [symbol.strip().upper() for symbol in symbols.split(",") if symbol.strip()]
     strategy = CheckpointConfluenceStrategy()
     signals = run_once(

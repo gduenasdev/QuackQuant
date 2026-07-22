@@ -39,6 +39,39 @@ cd backend
 python tests/test_stock_monitor_strategy.py --help
 ```
 
+## GUI Dashboard
+
+Start the API:
+
+```bash
+cd backend
+source .venv/bin/activate
+uvicorn app.main:app --reload --port 8001
+```
+
+In a second terminal, start the static UI from the repo root:
+
+```bash
+cd /Users/gduenas/Desktop/DEV_26/QuackQuant
+python3 -m http.server 8000
+```
+
+Open:
+
+```text
+http://127.0.0.1:8000
+```
+
+The dashboard can:
+
+- scan a comma-separated watchlist
+- switch between 30m and 60m checkpoints
+- record paper calls
+- show current scanner signals
+- show paper journal status
+
+If you run Docker Compose, open `http://localhost:8080`; Caddy proxies `/api/*` to the backend.
+
 Run a 30-minute scanner:
 
 ```bash
