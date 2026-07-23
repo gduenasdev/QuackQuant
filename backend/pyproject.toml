@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "quackquant-api"
 version = "0.1.0"
-description = "API scaffold for QuackQuant"
+description = "Paper-trading scanner API for QuackQuant"
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.115,<1.0",
@@ -28,4 +28,3 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
-

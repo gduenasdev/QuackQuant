@@ -12,6 +12,5 @@ def health() -> dict[str, str]:
 
 @router.get("/ready", summary="Dependency readiness check")
 def readiness() -> dict[str, str]:
-    # TODO: Verify PostgreSQL, Redis, worker, and required providers once configured.
+    # TODO: Verify market-data and broker adapters once they are configured.
     return {"status": "ready", "note": "No external dependencies configured yet"}
-

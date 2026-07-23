@@ -10,8 +10,8 @@ app = FastAPI(
     title=settings.app_name,
     version="0.1.0",
     description=(
-        "QuackQuant API scaffold. Except for health checks, endpoints intentionally "
-        "return 501 until their TODO contracts are implemented."
+        "QuackQuant paper-trading scanner API. Signals, journal updates, and "
+        "performance summaries are deterministic and paper-only."
     ),
 )
 
@@ -23,4 +23,3 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type", "Idempotency-Key"],
 )
 app.include_router(api_router, prefix=settings.api_prefix)
-

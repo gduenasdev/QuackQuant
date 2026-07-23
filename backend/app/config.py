@@ -7,12 +7,9 @@ class Settings(BaseSettings):
     app_name: str = "QuackQuant API"
     environment: str = "development"
     api_prefix: str = "/api/v1"
-    database_url: str | None = None
-    redis_url: str | None = None
     llm_provider: str = "none"
     llm_model: str | None = None
     ollama_base_url: str = "http://127.0.0.1:11434"
-    model_server_base_url: str | None = None
     allowed_origins: list[str] = [
         "http://localhost:8000",
         "http://127.0.0.1:8000",
