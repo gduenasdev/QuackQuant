@@ -38,8 +38,22 @@
     <main class="workspace">
       <section class="control-panel" aria-label="Scanner controls">
         <div>
+          <label for="scanner">Scanner</label>
+          <select id="scanner">
+            <option value="orb_vwap_pullback">ORB VWAP Pullback</option>
+            <option value="strat_fvg_liquidity">Strat FVG Liquidity</option>
+          </select>
+        </div>
+        <div>
+          <label for="data-source">Data Source</label>
+          <select id="data-source">
+            <option value="yahoo_candles">Yahoo candles</option>
+            <option value="robinhood_mcp">Robinhood MCP</option>
+          </select>
+        </div>
+        <div>
           <label for="symbols">Watchlist</label>
-          <input id="symbols" value="SPY,QQQ,AAPL,NVDA" autocomplete="off" />
+          <input id="symbols" value="SPY,QQQ,NVDA,TSLA,AMD,META,AMZN,AAPL,MSFT,GOOGL" autocomplete="off" />
         </div>
         <div>
           <label for="checkpoint">Checkpoint</label>
@@ -91,6 +105,7 @@
               <thead>
                 <tr>
                   <th>Symbol</th>
+                  <th>Scanner</th>
                   <th>Side</th>
                   <th>Grade</th>
                   <th>Score</th>
@@ -103,7 +118,7 @@
               </thead>
               <tbody id="signals-body">
                 <tr>
-                  <td colspan="9" class="empty">Run a scan to load current setups.</td>
+                  <td colspan="10" class="empty">Run a scan to load current setups.</td>
                 </tr>
               </tbody>
             </table>
@@ -117,6 +132,9 @@
               <p id="journal-summary">No journal loaded.</p>
             </div>
             <button id="refresh-journal" type="button" class="secondary small">Refresh</button>
+          </div>
+          <div id="performance-list" class="performance-list">
+            <p class="empty">Scanner performance appears after recorded calls.</p>
           </div>
           <div id="journal-list" class="journal-list">
             <p class="empty">Recorded LONG/SHORT calls will appear here.</p>
@@ -133,6 +151,8 @@
       const els = {
         apiState: document.getElementById("api-state"),
         clock: document.getElementById("clock"),
+        scanner: document.getElementById("scanner"),
+        dataSource: document.getElementById("data-source"),
         symbols: document.getElementById("symbols"),
         checkpoint: document.getElementById("checkpoint"),
         record: document.getElementById("record"),
@@ -145,6 +165,7 @@
         metricTime: document.getElementById("metric-time"),
         journalSummary: document.getElementById("journal-summary"),
         journalList: document.getElementById("journal-list"),
+        performanceList: document.getElementById("performance-list"),
         refreshJournal: document.getElementById("refresh-journal"),
       };
       let autoTimer = null;
@@ -158,6 +179,12 @@
         return value === null || value === undefined ? "-" : Number(value).toFixed(2);
       }
 
+      function prettyScanner(scanner) {
+        if (scanner === "orb_vwap_pullback") return "ORB/VWAP";
+        if (scanner === "strat_fvg_liquidity") return "Strat/FVG";
+        return scanner || "-";
+      }
+
       function renderSignals(signals) {
         els.metricSignals.textContent = signals.length;
         els.metricA.textContent = signals.filter((signal) => signal.grade === "A").length;
@@ -168,7 +195,7 @@
 
         if (!signals.length) {
           els.signalsBody.innerHTML =
-            '<tr><td colspan="9" class="empty">No symbols returned data.</td></tr>';
+            '<tr><td colspan="10" class="empty">No symbols returned data.</td></tr>';
           return;
         }
 
@@ -179,6 +206,7 @@
             return `
               <tr>
                 <td><strong>${signal.symbol}</strong></td>
+                <td>${prettyScanner(signal.scanner)}</td>
                 <td><span class="side ${signal.side.toLowerCase()}">${signal.side}</span></td>
                 <td><span class="grade">${signal.grade}</span></td>
                 <td>${signal.confidence}</td>
@@ -209,7 +237,7 @@
               <article class="journal-item">
                 <div>
                   <strong>${row.symbol} ${row.side}</strong>
-                  <span>${row.grade} / ${row.confidence}</span>
+                  <span>${prettyScanner(row.scanner)} / ${row.grade} / ${row.confidence}</span>
                 </div>
                 <div>
                   <span>${row.status}</span>
@@ -221,18 +249,43 @@
           .join("");
       }
 
+      function renderPerformance(performance) {
+        if (!performance.length) {
+          els.performanceList.innerHTML =
+            '<p class="empty">Scanner performance appears after recorded calls.</p>';
+          return;
+        }
+
+        els.performanceList.innerHTML = performance
+          .map(
+            (item) => `
+              <article class="performance-item">
+                <strong>${prettyScanner(item.scanner)}</strong>
+                <span>${item.closed}/10 closed</span>
+                <span>${item.win_rate}% win</span>
+                <span>${Number(item.avg_result_pct || 0).toFixed(3)}%</span>
+                <b>${item.ready_for_review ? "Review ready" : `${item.trades_until_review} left`}</b>
+              </article>
+            `,
+          )
+          .join("");
+      }
+
       async function loadJournal() {
-        const [summaryResponse, journalResponse] = await Promise.all([
+        const [summaryResponse, journalResponse, performanceResponse] = await Promise.all([
           fetch(`${apiBase}/scanner/journal/summary`),
           fetch(`${apiBase}/scanner/journal`),
+          fetch(`${apiBase}/scanner/journal/performance`),
         ]);
-        if (!summaryResponse.ok || !journalResponse.ok) {
+        if (!summaryResponse.ok || !journalResponse.ok || !performanceResponse.ok) {
           throw new Error("Journal API unavailable");
         }
         const summary = await summaryResponse.json();
         const journal = await journalResponse.json();
+        const performance = await performanceResponse.json();
         els.journalSummary.textContent = summary.summary;
         renderJournal(journal.rows || []);
+        renderPerformance(performance.performance || []);
       }
 
       async function scan() {
@@ -242,11 +295,14 @@
           const params = new URLSearchParams({
             symbols: els.symbols.value,
             checkpoint_minutes: els.checkpoint.value,
+            scanner: els.scanner.value,
+            data_source: els.dataSource.value,
             record: String(els.record.checked),
           });
           const response = await fetch(`${apiBase}/scanner/signals?${params}`);
           if (!response.ok) {
-            throw new Error(`Scanner API returned ${response.status}`);
+            const detail = await response.json().catch(() => ({}));
+            throw new Error(detail.detail || `Scanner API returned ${response.status}`);
           }
           const payload = await response.json();
           renderSignals(payload.signals || []);
@@ -254,7 +310,7 @@
           setState("Connected", "ok");
         } catch (error) {
           setState("API offline", "error");
-          els.signalsBody.innerHTML = `<tr><td colspan="9" class="empty">${error.message}</td></tr>`;
+          els.signalsBody.innerHTML = `<tr><td colspan="10" class="empty">${error.message}</td></tr>`;
         } finally {
           els.scan.disabled = false;
         }

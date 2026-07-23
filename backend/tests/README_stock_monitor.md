@@ -30,6 +30,12 @@ The scanner combines several signals:
 - Volume confirmation
 - Fixed percentage stop and targets
 
+There are currently two paper scanners:
+
+- `orb_vwap_pullback`: 15-minute opening range breakout with VWAP pullback. This is the
+  Robinhood-ready scanner intended for future option-chain and order-routing integration.
+- `strat_fvg_liquidity`: Strat, FVG, liquidity sweep, CHOCH, trend, and volume confluence.
+
 ## First Run
 
 From the backend folder:
@@ -65,12 +71,39 @@ http://127.0.0.1:8000
 The dashboard can:
 
 - scan a comma-separated watchlist
+- switch scanner strategies
+- switch market-data source
 - switch between 30m and 60m checkpoints
 - record paper calls
 - show current scanner signals
 - show paper journal status
+- compare scanner performance after recorded trades
 
 If you run Docker Compose, open `http://localhost:8080`; Caddy proxies `/api/*` to the backend.
+
+## Robinhood MCP Source Of Truth
+
+Robinhood MCP is the intended future source of truth for tradability, scans, watchlists, account data,
+and eventually option-chain selection. The app currently shows `Robinhood MCP` as a data-source option,
+but blocks it until a backend/Codex adapter can actually access the Robinhood MCP tools.
+
+When the Robinhood adapter is available, the scanner must call Robinhood's scanner/filter-spec tool
+first, such as `get_scanner_filter_specs`, and then build filters using only fields Robinhood says are
+supported. Do not invent filter names.
+
+Keep this order:
+
+```text
+1. Robinhood MCP read-only market/account/scanner data.
+2. Paper scanner signals only.
+3. 10 closed paper calls per scanner.
+4. Manual performance review.
+5. Paper broker orders only.
+6. Manual review after at least 50 paper orders.
+7. Live order placement only with an explicit enable switch.
+```
+
+Order placement is not enabled in this app.
 
 Run a 30-minute scanner:
 
@@ -82,6 +115,9 @@ python tests/test_stock_monitor_strategy.py \
 ```
 
 This will print scanner output and update the paper journal every poll.
+
+For the GUI, choose `ORB VWAP Pullback` when you want to test the new opening-range strategy.
+It ranks the small universe and records at most one actionable paper call per scan.
 
 Run a 60-minute scanner:
 
@@ -226,6 +262,19 @@ python tests/test_stock_monitor_strategy.py \
 
 The script has a 60-minute same-symbol/same-side cooldown so one setup is not counted repeatedly
 while it stays visible on the chart.
+
+The GUI shows per-scanner performance. Do not enable any future broker execution until a scanner has
+at least 10 closed paper calls and you have reviewed the trades manually.
+
+The first broker integration should still be gated:
+
+```text
+1. Paper scanner reaches 10 closed trades.
+2. Review win rate, average result, screenshots, and rule adherence.
+3. Enable paper broker orders only.
+4. Review at least 50 paper broker orders.
+5. Consider live trading with manual approval.
+```
 
 ## First-Day Rules
 

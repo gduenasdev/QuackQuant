@@ -20,6 +20,7 @@ SignalSide = Literal["LONG", "SHORT", "WAIT"]
 SetupName = Literal["continuation", "breakout", "rejection", "chop", "insufficient_data"]
 PatternSide = Literal["bullish", "bearish"]
 StratScenario = Literal["1", "2U", "2D", "3"]
+ScannerName = Literal["strat_fvg_liquidity", "orb_vwap_pullback"]
 
 EASTERN = ZoneInfo("America/New_York")
 MARKET_OPEN = clock_time(9, 30)
@@ -28,6 +29,7 @@ DEFAULT_JOURNAL_PATH = Path(__file__).with_name("stock_monitor_journal.csv")
 JOURNAL_COOLDOWN_MINUTES = 60
 JOURNAL_FIELDS = [
     "id",
+    "scanner",
     "opened_at",
     "closed_at",
     "symbol",
@@ -108,6 +110,7 @@ class StratSignal:
 
 @dataclass(frozen=True)
 class SetupSignal:
+    scanner: ScannerName
     symbol: str
     side: SignalSide
     setup: SetupName
@@ -353,6 +356,7 @@ class CheckpointConfluenceStrategy:
             target_2_price = quote.price * (1 - self.target_2_pct / 100)
 
         return SetupSignal(
+            scanner="strat_fvg_liquidity",
             symbol=quote.symbol,
             side=side,
             setup=setup,
@@ -382,6 +386,7 @@ class CheckpointConfluenceStrategy:
         warnings: list[str],
     ) -> SetupSignal:
         return SetupSignal(
+            scanner="strat_fvg_liquidity",
             symbol=quote.symbol,
             side="WAIT",
             setup=setup,
@@ -415,6 +420,339 @@ class CheckpointConfluenceStrategy:
         return "NO_TRADE"
 
 
+class OpeningRangeBreakoutStrategy:
+    """Paper-only 15-minute opening range breakout with VWAP pullback scanner."""
+
+    tier_1 = {"SPY", "QQQ"}
+    tier_2 = {"NVDA", "TSLA", "AMD", "META", "AMZN"}
+    tier_3 = {"AAPL", "MSFT", "GOOGL"}
+
+    def __init__(
+        self,
+        min_score: int = 80,
+        target_reward_risk: float = 1.5,
+        risk_atr_multiple: float = 0.6,
+        strong_volume_ratio: float = 1.5,
+    ) -> None:
+        self.min_score = min_score
+        self.target_reward_risk = target_reward_risk
+        self.risk_atr_multiple = risk_atr_multiple
+        self.strong_volume_ratio = strong_volume_ratio
+
+    def evaluate_universe(self, candles_by_symbol: dict[str, list[Candle]]) -> list[SetupSignal]:
+        market_bias = self._market_bias(candles_by_symbol)
+        candidates: list[SetupSignal] = []
+
+        for symbol, candles in candles_by_symbol.items():
+            signal = self.evaluate_symbol(symbol, candles, market_bias)
+            candidates.append(signal)
+
+        actionable = [
+            signal for signal in candidates if signal.side != "WAIT" and signal.confidence >= self.min_score
+        ]
+        if not actionable:
+            return sorted(candidates, key=lambda item: item.confidence, reverse=True)
+
+        winner = sorted(actionable, key=lambda item: item.confidence, reverse=True)[0]
+        return [
+            winner,
+            *[
+                self._stand_down(signal, f"ranked below selected candidate {winner.symbol}")
+                if signal.side != "WAIT" and signal.symbol != winner.symbol
+                else signal
+                for signal in candidates
+                if signal.symbol != winner.symbol
+            ],
+        ]
+
+    def evaluate_symbol(
+        self,
+        symbol: str,
+        candles: list[Candle],
+        market_bias: SignalSide,
+    ) -> SetupSignal:
+        session = latest_regular_session(candles)
+        if len(session) < 6:
+            return self._wait(symbol, candles, 0, ["not enough regular-session candles"], [])
+
+        latest = session[-1]
+        if not is_entry_window(latest.opened_at):
+            return self._wait(
+                symbol,
+                session,
+                0,
+                ["outside ORB entry windows"],
+                ["entries allowed 9:45-11:15 ET and 13:30-15:30 ET"],
+            )
+
+        opening_range = opening_range_candles(session)
+        if len(opening_range) < 3:
+            return self._wait(symbol, session, 0, ["15-minute opening range not complete"], [])
+
+        or_high = max(candle.high for candle in opening_range)
+        or_low = min(candle.low for candle in opening_range)
+        vwap_value = vwap(session)
+        ema_9 = ema([candle.close for candle in session], 9)
+        ema_20 = ema([candle.close for candle in session], 20)
+        atr_5m = average_true_range(session, 14)
+        recent_volumes = [candle.volume for candle in session[-20:] if candle.volume > 0]
+        avg_volume = mean(recent_volumes) if recent_volumes else 0
+        volume_ratio = latest.volume / avg_volume if avg_volume else 0
+        previous_high, previous_low, previous_close = previous_session_levels(candles, latest.opened_at)
+        daily_move_pct = abs(((latest.close - previous_close) / previous_close) * 100) if previous_close else 0
+
+        long_score, long_reasons, long_warnings = self._score_side(
+            side="LONG",
+            symbol=symbol,
+            session=session,
+            or_high=or_high,
+            or_low=or_low,
+            vwap_value=vwap_value,
+            ema_9=ema_9,
+            ema_20=ema_20,
+            atr_5m=atr_5m,
+            previous_high=previous_high,
+            previous_low=previous_low,
+            daily_move_pct=daily_move_pct,
+            volume_ratio=volume_ratio,
+            market_bias=market_bias,
+        )
+        short_score, short_reasons, short_warnings = self._score_side(
+            side="SHORT",
+            symbol=symbol,
+            session=session,
+            or_high=or_high,
+            or_low=or_low,
+            vwap_value=vwap_value,
+            ema_9=ema_9,
+            ema_20=ema_20,
+            atr_5m=atr_5m,
+            previous_high=previous_high,
+            previous_low=previous_low,
+            daily_move_pct=daily_move_pct,
+            volume_ratio=volume_ratio,
+            market_bias=market_bias,
+        )
+
+        if max(long_score, short_score) < self.min_score:
+            return self._wait(
+                symbol,
+                session,
+                max(long_score, short_score),
+                [
+                    f"ORB/VWAP setup below {self.min_score} threshold",
+                    f"long_score={long_score}",
+                    f"short_score={short_score}",
+                    f"OR={or_low:.2f}-{or_high:.2f}",
+                ],
+                ["paper-only; Robinhood option-chain validation is not connected yet"],
+            )
+
+        if long_score >= short_score:
+            return self._trade("LONG", symbol, session, atr_5m, long_score, long_reasons, long_warnings)
+
+        return self._trade("SHORT", symbol, session, atr_5m, short_score, short_reasons, short_warnings)
+
+    def _market_bias(self, candles_by_symbol: dict[str, list[Candle]]) -> SignalSide:
+        votes: list[SignalSide] = []
+        for symbol in ("SPY", "QQQ"):
+            session = latest_regular_session(candles_by_symbol.get(symbol, []))
+            if len(session) < 3:
+                continue
+
+            latest = session[-1]
+            vwap_value = vwap(session)
+            closes = [candle.close for candle in session]
+            if latest.close > vwap_value and ema(closes, 9) > ema(closes, 20):
+                votes.append("LONG")
+            elif latest.close < vwap_value and ema(closes, 9) < ema(closes, 20):
+                votes.append("SHORT")
+
+        if votes.count("LONG") == 2:
+            return "LONG"
+        if votes.count("SHORT") == 2:
+            return "SHORT"
+        return "WAIT"
+
+    def _score_side(
+        self,
+        side: Literal["LONG", "SHORT"],
+        symbol: str,
+        session: list[Candle],
+        or_high: float,
+        or_low: float,
+        vwap_value: float,
+        ema_9: float,
+        ema_20: float,
+        atr_5m: float,
+        previous_high: float | None,
+        previous_low: float | None,
+        daily_move_pct: float,
+        volume_ratio: float,
+        market_bias: SignalSide,
+    ) -> tuple[int, list[str], list[str]]:
+        latest = session[-1]
+        score = 0
+        reasons: list[str] = []
+        warnings = [
+            "earnings, catalyst, economic-calendar, and option-spread checks need Robinhood/MCP data",
+        ]
+
+        breakout_index = find_orb_breakout_index(session, side, or_high, or_low, self.strong_volume_ratio)
+        pullback_ok = breakout_index is not None and pullback_held(session, breakout_index, side, or_high, or_low, vwap_value)
+        trigger_ok = breakout_index is not None and trigger_broke(session, breakout_index, side)
+        room_ok = has_unobstructed_room(
+            side=side,
+            entry=latest.close,
+            atr_5m=atr_5m,
+            reward_risk=self.target_reward_risk,
+            previous_high=previous_high,
+            previous_low=previous_low,
+        )
+        market_ok = market_bias in (side, "WAIT")
+        price_filter_ok = latest.close > 20
+        daily_move_ok = daily_move_pct >= 0.75
+        relative_volume_ok = volume_ratio >= self.strong_volume_ratio
+
+        if side == "LONG":
+            checks = [
+                (relative_volume_ok, 10, f"relative volume proxy {volume_ratio:.2f} >= 1.5"),
+                (latest.close > vwap_value, 10, "price is above VWAP"),
+                (ema_9 > ema_20, 10, "5m 9 EMA is above 20 EMA"),
+                (breakout_index is not None, 10, "closed above 15m opening-range high"),
+                (relative_volume_ok, 10, "breakout/recent volume is strong"),
+                (market_ok, 10, "SPY/QQQ bias does not fight long setup"),
+                (room_ok, 10, "at least 1.5R of room by prior-session levels"),
+                (price_filter_ok and daily_move_ok, 10, "price and daily-move filters pass"),
+                (symbol in self.tier_1 or volume_ratio >= 2.0, 10, "symbol tier/liquidity filter passes"),
+                (pullback_ok and trigger_ok, 10, "orderly pullback held and trigger broke"),
+            ]
+        else:
+            checks = [
+                (relative_volume_ok, 10, f"relative volume proxy {volume_ratio:.2f} >= 1.5"),
+                (latest.close < vwap_value, 10, "price is below VWAP"),
+                (ema_9 < ema_20, 10, "5m 9 EMA is below 20 EMA"),
+                (breakout_index is not None, 10, "closed below 15m opening-range low"),
+                (relative_volume_ok, 10, "breakdown/recent volume is strong"),
+                (market_ok, 10, "SPY/QQQ bias does not fight short setup"),
+                (room_ok, 10, "at least 1.5R of room by prior-session levels"),
+                (price_filter_ok and daily_move_ok, 10, "price and daily-move filters pass"),
+                (symbol in self.tier_1 or volume_ratio >= 2.0, 10, "symbol tier/liquidity filter passes"),
+                (pullback_ok and trigger_ok, 10, "orderly bounce failed and trigger broke"),
+            ]
+
+        for passed, points, reason in checks:
+            if passed:
+                score += points
+                reasons.append(f"+{points} {reason}")
+
+        if symbol == "TSLA":
+            warnings.append("TSLA should use half normal risk during the first 50 trades")
+        if side == "SHORT":
+            warnings.append("bearish paper signal maps to buying a put, not shorting shares")
+
+        return score, reasons, warnings
+
+    def _trade(
+        self,
+        side: Literal["LONG", "SHORT"],
+        symbol: str,
+        session: list[Candle],
+        atr_5m: float,
+        confidence: int,
+        reasons: list[str],
+        warnings: list[str],
+    ) -> SetupSignal:
+        latest = session[-1]
+        pullback = session[-2]
+        atr_stop = atr_5m * self.risk_atr_multiple
+        if side == "LONG":
+            stop_price = min(pullback.low, latest.close - atr_stop)
+            risk = latest.close - stop_price
+            target_1 = latest.close + risk * self.target_reward_risk
+            target_2 = latest.close + risk * 2
+        else:
+            stop_price = max(pullback.high, latest.close + atr_stop)
+            risk = stop_price - latest.close
+            target_1 = latest.close - risk * self.target_reward_risk
+            target_2 = latest.close - risk * 2
+
+        risk_pct = (risk / latest.close) * 100 if latest.close else 0
+        return SetupSignal(
+            scanner="orb_vwap_pullback",
+            symbol=symbol,
+            side=side,
+            setup="breakout",
+            confidence=confidence,
+            grade="A" if confidence >= 90 else "B",
+            price=latest.close,
+            entry_price=latest.close,
+            stop_price=stop_price,
+            target_1_price=target_1,
+            target_2_price=target_2,
+            risk_pct=risk_pct,
+            target_1_pct=risk_pct * self.target_reward_risk,
+            target_2_pct=risk_pct * 2,
+            reward_to_risk=self.target_reward_risk,
+            reasons=reasons,
+            warnings=warnings,
+            observed_at=latest.opened_at,
+        )
+
+    def _wait(
+        self,
+        symbol: str,
+        candles: list[Candle],
+        confidence: int,
+        reasons: list[str],
+        warnings: list[str],
+    ) -> SetupSignal:
+        observed_at = candles[-1].opened_at if candles else datetime.now(tz=EASTERN)
+        price = candles[-1].close if candles else 0
+        return SetupSignal(
+            scanner="orb_vwap_pullback",
+            symbol=symbol,
+            side="WAIT",
+            setup="chop" if candles else "insufficient_data",
+            confidence=confidence,
+            grade="WATCH" if confidence >= 50 else "NO_TRADE",
+            price=price,
+            entry_price=None,
+            stop_price=None,
+            target_1_price=None,
+            target_2_price=None,
+            risk_pct=0,
+            target_1_pct=0,
+            target_2_pct=0,
+            reward_to_risk=self.target_reward_risk,
+            reasons=reasons,
+            warnings=warnings,
+            observed_at=observed_at,
+        )
+
+    def _stand_down(self, signal: SetupSignal, reason: str) -> SetupSignal:
+        return SetupSignal(
+            scanner=signal.scanner,
+            symbol=signal.symbol,
+            side="WAIT",
+            setup=signal.setup,
+            confidence=signal.confidence,
+            grade="WATCH",
+            price=signal.price,
+            entry_price=None,
+            stop_price=None,
+            target_1_price=None,
+            target_2_price=None,
+            risk_pct=signal.risk_pct,
+            target_1_pct=signal.target_1_pct,
+            target_2_pct=signal.target_2_pct,
+            reward_to_risk=signal.reward_to_risk,
+            reasons=[reason, *signal.reasons],
+            warnings=signal.warnings,
+            observed_at=signal.observed_at,
+        )
+
+
 def ema(values: list[float], period: int) -> float:
     if not values:
         return 0
@@ -424,6 +762,173 @@ def ema(values: list[float], period: int) -> float:
     for value in values[1:]:
         result = (value - result) * multiplier + result
     return result
+
+
+def latest_regular_session(candles: list[Candle]) -> list[Candle]:
+    regular = [candle for candle in candles if is_regular_market_open(candle.opened_at)]
+    if not regular:
+        return []
+
+    latest_date = regular[-1].opened_at.astimezone(EASTERN).date()
+    return [candle for candle in regular if candle.opened_at.astimezone(EASTERN).date() == latest_date]
+
+
+def previous_session_levels(
+    candles: list[Candle],
+    current_time: datetime,
+) -> tuple[float | None, float | None, float | None]:
+    regular = [candle for candle in candles if is_regular_market_open(candle.opened_at)]
+    current_date = current_time.astimezone(EASTERN).date()
+    previous = [
+        candle for candle in regular if candle.opened_at.astimezone(EASTERN).date() < current_date
+    ]
+    if not previous:
+        return None, None, None
+
+    previous_date = previous[-1].opened_at.astimezone(EASTERN).date()
+    previous_session = [
+        candle for candle in previous if candle.opened_at.astimezone(EASTERN).date() == previous_date
+    ]
+    return (
+        max(candle.high for candle in previous_session),
+        min(candle.low for candle in previous_session),
+        previous_session[-1].close,
+    )
+
+
+def opening_range_candles(candles: list[Candle]) -> list[Candle]:
+    return [
+        candle
+        for candle in candles
+        if clock_time(9, 30) <= candle.opened_at.astimezone(EASTERN).time() < clock_time(9, 45)
+    ]
+
+
+def is_entry_window(now: datetime) -> bool:
+    eastern_time = now.astimezone(EASTERN).time()
+    return clock_time(9, 45) <= eastern_time <= clock_time(11, 15) or clock_time(
+        13, 30
+    ) <= eastern_time <= clock_time(15, 30)
+
+
+def vwap(candles: list[Candle]) -> float:
+    volume_sum = sum(candle.volume for candle in candles if candle.volume > 0)
+    if volume_sum <= 0:
+        return candles[-1].close if candles else 0
+
+    typical_value_sum = sum(
+        ((candle.high + candle.low + candle.close) / 3) * candle.volume
+        for candle in candles
+        if candle.volume > 0
+    )
+    return typical_value_sum / volume_sum
+
+
+def average_true_range(candles: list[Candle], period: int) -> float:
+    if len(candles) < 2:
+        return 0
+
+    ranges: list[float] = []
+    for index in range(1, len(candles)):
+        current = candles[index]
+        previous_close = candles[index - 1].close
+        ranges.append(
+            max(
+                current.high - current.low,
+                abs(current.high - previous_close),
+                abs(current.low - previous_close),
+            )
+        )
+
+    return mean(ranges[-period:]) if ranges else 0
+
+
+def find_orb_breakout_index(
+    session: list[Candle],
+    side: Literal["LONG", "SHORT"],
+    or_high: float,
+    or_low: float,
+    strong_volume_ratio: float,
+) -> int | None:
+    for index, candle in enumerate(session):
+        if candle.opened_at.astimezone(EASTERN).time() < clock_time(9, 45):
+            continue
+
+        prior_volumes = [item.volume for item in session[max(0, index - 20) : index] if item.volume > 0]
+        avg_volume = mean(prior_volumes) if prior_volumes else 0
+        volume_ok = avg_volume <= 0 or candle.volume >= avg_volume * strong_volume_ratio
+        if side == "LONG" and candle.close > or_high and volume_ok:
+            return index
+        if side == "SHORT" and candle.close < or_low and volume_ok:
+            return index
+
+    return None
+
+
+def pullback_held(
+    session: list[Candle],
+    breakout_index: int,
+    side: Literal["LONG", "SHORT"],
+    or_high: float,
+    or_low: float,
+    vwap_value: float,
+) -> bool:
+    pullback = session[breakout_index + 1 : breakout_index + 4]
+    if not pullback:
+        return False
+
+    breakout_volume = session[breakout_index].volume
+    pullback_volume_declined = mean(candle.volume for candle in pullback) < breakout_volume
+    if side == "LONG":
+        held_level = min(candle.low for candle in pullback) >= min(or_high, vwap_value)
+    else:
+        held_level = max(candle.high for candle in pullback) <= max(or_low, vwap_value)
+
+    return pullback_volume_declined and held_level
+
+
+def trigger_broke(
+    session: list[Candle],
+    breakout_index: int,
+    side: Literal["LONG", "SHORT"],
+) -> bool:
+    pullback = session[breakout_index + 1 : breakout_index + 4]
+    if not pullback:
+        return False
+
+    latest = session[-1]
+    final_pullback = pullback[-1]
+    if side == "LONG":
+        return latest.close > final_pullback.high
+    return latest.close < final_pullback.low
+
+
+def has_unobstructed_room(
+    side: Literal["LONG", "SHORT"],
+    entry: float,
+    atr_5m: float,
+    reward_risk: float,
+    previous_high: float | None,
+    previous_low: float | None,
+) -> bool:
+    if atr_5m <= 0:
+        return False
+
+    required_room = atr_5m * reward_risk
+    if side == "LONG":
+        return previous_high is None or previous_high <= entry or previous_high - entry >= required_room
+    return previous_low is None or previous_low >= entry or entry - previous_low >= required_room
+
+
+def run_orb_once(symbols: list[str]) -> list[SetupSignal]:
+    requested_symbols = sorted(set(symbols))
+    candles_by_symbol = {
+        symbol: fetch_yahoo_5m_candles(symbol)
+        for symbol in sorted(set(requested_symbols) | {"SPY", "QQQ"})
+    }
+    strategy = OpeningRangeBreakoutStrategy()
+    signals = strategy.evaluate_universe(candles_by_symbol)
+    return [signal for signal in signals if signal.symbol in requested_symbols]
 
 
 def detect_fair_value_gaps(
@@ -880,12 +1385,13 @@ def write_journal(journal_path: Path, rows: list[dict[str, str]]) -> None:
 
 def journal_signal_id(signal: SetupSignal) -> str:
     timestamp = signal.observed_at.strftime("%Y%m%dT%H%M")
-    return f"{timestamp}-{signal.symbol}-{signal.side}-{signal.setup}-{signal.grade}"
+    return f"{timestamp}-{signal.scanner}-{signal.symbol}-{signal.side}-{signal.setup}-{signal.grade}"
 
 
 def signal_to_journal_row(signal: SetupSignal) -> dict[str, str]:
     return {
         "id": journal_signal_id(signal),
+        "scanner": signal.scanner,
         "opened_at": signal.observed_at.isoformat(),
         "closed_at": "",
         "symbol": signal.symbol,
@@ -911,6 +1417,7 @@ def format_optional_price(price: float | None) -> str:
 def has_open_trade(rows: list[dict[str, str]], signal: SetupSignal) -> bool:
     return any(
         row.get("status") == "OPEN"
+        and row.get("scanner", "strat_fvg_liquidity") == signal.scanner
         and row.get("symbol") == signal.symbol
         and row.get("side") == signal.side
         for row in rows
@@ -919,7 +1426,11 @@ def has_open_trade(rows: list[dict[str, str]], signal: SetupSignal) -> bool:
 
 def has_recent_trade(rows: list[dict[str, str]], signal: SetupSignal) -> bool:
     for row in rows:
-        if row.get("symbol") != signal.symbol or row.get("side") != signal.side:
+        if (
+            row.get("scanner", "strat_fvg_liquidity") != signal.scanner
+            or row.get("symbol") != signal.symbol
+            or row.get("side") != signal.side
+        ):
             continue
 
         opened_at = datetime.fromisoformat(row["opened_at"])
@@ -1009,6 +1520,40 @@ def summarize_journal(journal_path: Path) -> str:
         f"journal={journal_path} total={len(rows)} open={open_count} closed={len(closed)} "
         f"wins={len(winners)} win_rate={win_rate:.1f}% avg_result={avg_result:.3f}%"
     )
+
+
+def summarize_journal_performance(journal_path: Path) -> list[dict[str, object]]:
+    rows = read_journal(journal_path)
+    scanners = sorted({row.get("scanner", "strat_fvg_liquidity") for row in rows})
+    summaries: list[dict[str, object]] = []
+    for scanner in scanners:
+        scanner_rows = [
+            row for row in rows if row.get("scanner", "strat_fvg_liquidity") == scanner
+        ]
+        closed = [
+            row for row in scanner_rows if row.get("status") in {"TARGET_1", "TARGET_2", "STOPPED"}
+        ]
+        winners = [row for row in closed if row.get("status") in {"TARGET_1", "TARGET_2"}]
+        losses = [row for row in closed if row.get("status") == "STOPPED"]
+        open_count = count_open_trades(scanner_rows)
+        win_rate = (len(winners) / len(closed) * 100) if closed else 0
+        avg_result = mean(float(row["result_pct"]) for row in closed) if closed else 0
+        summaries.append(
+            {
+                "scanner": scanner,
+                "total": len(scanner_rows),
+                "open": open_count,
+                "closed": len(closed),
+                "wins": len(winners),
+                "losses": len(losses),
+                "win_rate": round(win_rate, 1),
+                "avg_result_pct": round(avg_result, 3),
+                "ready_for_review": len(closed) >= 10,
+                "trades_until_review": max(0, 10 - len(closed)),
+            }
+        )
+
+    return summaries
 
 
 def run_once(

@@ -132,7 +132,7 @@ select {
 }
 
 .control-panel {
-  grid-template-columns: minmax(260px, 1fr) 180px 150px auto;
+  grid-template-columns: 210px 190px minmax(280px, 1fr) 180px 150px auto;
   align-items: end;
   padding: 16px;
   border: 1px solid var(--line);
@@ -365,6 +365,34 @@ th {
   max-height: calc(100vh - 220px);
   overflow: auto;
   padding: 10px;
+}
+
+.performance-list {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border-bottom: 1px solid var(--line);
+  background: #fbfaf7;
+}
+
+.performance-item {
+  display: grid;
+  grid-template-columns: 1fr repeat(4, auto);
+  gap: 9px;
+  align-items: center;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: white;
+  font-size: 12px;
+}
+
+.performance-item span {
+  color: var(--muted);
+}
+
+.performance-item b {
+  color: var(--blue);
 }
 
 .journal-item {

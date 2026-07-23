@@ -24,3 +24,20 @@ def test_scanner_journal_summary() -> None:
 
     assert response.status_code == 200
     assert "summary" in response.json()
+
+
+def test_scanner_journal_performance() -> None:
+    response = client.get("/api/v1/scanner/journal/performance")
+
+    assert response.status_code == 200
+    assert "performance" in response.json()
+
+
+def test_robinhood_data_source_is_blocked_until_adapter_exists() -> None:
+    response = client.get(
+        "/api/v1/scanner/signals",
+        params={"data_source": "robinhood_mcp", "record": "false"},
+    )
+
+    assert response.status_code == 501
+    assert "Robinhood MCP" in response.json()["detail"]
