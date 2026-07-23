@@ -1,9 +1,41 @@
 from fastapi import APIRouter
 
 from app.api.todos import not_implemented
+from app.config import get_settings
 from app.schemas import AgentRunCreate
 
 router = APIRouter()
+
+
+@router.get("/agents/model-providers")
+def model_providers() -> dict[str, object]:
+    settings = get_settings()
+    return {
+        "active": settings.llm_provider,
+        "model": settings.llm_model,
+        "providers": [
+            {
+                "id": "none",
+                "label": "No LLM",
+                "role": "Deterministic scanner math only",
+                "available": True,
+            },
+            {
+                "id": "ollama",
+                "label": "Ollama",
+                "role": "Optional local explanations, summaries, and agent review",
+                "available": bool(settings.ollama_base_url),
+                "base_url": settings.ollama_base_url,
+            },
+            {
+                "id": "openai",
+                "label": "OpenAI",
+                "role": "Optional hosted explanations, summaries, and agent review",
+                "available": settings.llm_provider == "openai",
+            },
+        ],
+        "scanner_dependency": "Signals, paper fills, stops, targets, and performance stats are deterministic math and do not require an LLM.",
+    }
 
 
 @router.post("/agents/{agent_id}/runs", status_code=202)
@@ -35,4 +67,3 @@ def run_events(run_id: str) -> None:
 def run_decisions(run_id: str) -> None:
     # TODO: Return append-only decisions, inputs, policy checks, and outcomes.
     not_implemented("Expose an immutable, redacted decision audit trail.")
-

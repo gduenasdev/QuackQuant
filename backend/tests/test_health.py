@@ -40,4 +40,19 @@ def test_robinhood_data_source_is_blocked_until_adapter_exists() -> None:
     )
 
     assert response.status_code == 501
-    assert "Robinhood MCP" in response.json()["detail"]
+    assert "verified in Codex" in response.json()["detail"]
+
+
+def test_robinhood_filter_specs_endpoint() -> None:
+    response = client.get("/api/v1/scanner/robinhood/filter-specs")
+
+    assert response.status_code == 200
+    assert "FILTER_TYPE_VWAP" in response.json()["filters"]
+
+
+def test_model_providers_endpoint() -> None:
+    response = client.get("/api/v1/agents/model-providers")
+
+    assert response.status_code == 200
+    assert response.json()["active"] == "none"
+    assert "deterministic math" in response.json()["scanner_dependency"]

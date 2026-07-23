@@ -132,7 +132,7 @@ select {
 }
 
 .control-panel {
-  grid-template-columns: 210px 190px minmax(280px, 1fr) 180px 150px auto;
+  grid-template-columns: 210px 190px minmax(280px, 1fr) 180px 150px 130px auto;
   align-items: end;
   padding: 16px;
   border: 1px solid var(--line);
@@ -174,6 +174,27 @@ select {
 .toggle input {
   width: 18px;
   height: 18px;
+}
+
+.model-status {
+  height: 42px;
+  display: grid;
+  align-content: center;
+  gap: 3px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fbfaf7;
+}
+
+.model-status span {
+  color: var(--muted);
+  font: 700 10px/1 "DM Mono", monospace;
+  text-transform: uppercase;
+}
+
+.model-status strong {
+  font-size: 12px;
 }
 
 .actions {
@@ -359,6 +380,15 @@ th {
 .journal-panel {
   position: sticky;
   top: 94px;
+}
+
+.journal-panel header p span {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.journal-panel header p strong {
+  color: var(--ink);
 }
 
 .journal-list {

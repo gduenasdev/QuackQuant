@@ -105,6 +105,35 @@ Keep this order:
 
 Order placement is not enabled in this app.
 
+The Robinhood MCP connection has been verified inside Codex with the read-only
+`get_scanner_filter_specs` call. The backend adapter is still pending, so the FastAPI app cannot call
+Robinhood directly yet.
+
+## LLM Usage
+
+The scanners are not LLM-powered. Market data parsing, indicators, paper entries, stops, targets,
+journal updates, and performance stats are deterministic math.
+
+Use an LLM only for optional layers:
+
+- explaining why a signal appeared
+- summarizing the paper journal
+- comparing scanner performance
+- drafting strategy review notes
+- later agent workflows that propose, but do not automatically place, orders
+
+Supported configuration direction:
+
+```text
+QUACKQUANT_LLM_PROVIDER=none
+QUACKQUANT_LLM_PROVIDER=ollama
+QUACKQUANT_OLLAMA_BASE_URL=http://127.0.0.1:11434
+QUACKQUANT_LLM_MODEL=llama3.1
+```
+
+Keep `none` as the default while validating scanner performance. Ollama or OpenAI can be added later
+without changing the scanner math.
+
 Run a 30-minute scanner:
 
 ```bash

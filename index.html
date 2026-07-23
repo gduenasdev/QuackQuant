@@ -66,6 +66,10 @@
           <input id="record" type="checkbox" checked />
           <span>Record calls</span>
         </label>
+        <div class="model-status">
+          <span>LLM</span>
+          <strong id="model-provider">Math only</strong>
+        </div>
         <div class="actions">
           <button id="scan" type="button">Scan Now</button>
           <button id="auto" type="button" class="secondary">Auto Off</button>
@@ -153,6 +157,7 @@
         clock: document.getElementById("clock"),
         scanner: document.getElementById("scanner"),
         dataSource: document.getElementById("data-source"),
+        modelProvider: document.getElementById("model-provider"),
         symbols: document.getElementById("symbols"),
         checkpoint: document.getElementById("checkpoint"),
         record: document.getElementById("record"),
@@ -271,6 +276,21 @@
           .join("");
       }
 
+      function renderJournalSummary(summary) {
+        const parts = Object.fromEntries(
+          summary
+            .split(" ")
+            .map((part) => part.split("="))
+            .filter((part) => part.length === 2),
+        );
+        const filename = parts.journal ? parts.journal.split("/").pop() : "stock_monitor_journal.csv";
+        els.journalSummary.innerHTML = `
+          <span><strong>${filename}</strong></span>
+          <span>total=${parts.total || 0} open=${parts.open || 0} closed=${parts.closed || 0}</span>
+          <span>wins=${parts.wins || 0} win_rate=${parts.win_rate || "0.0%"} avg=${parts.avg_result_pct || "0.000%"}</span>
+        `;
+      }
+
       async function loadJournal() {
         const [summaryResponse, journalResponse, performanceResponse] = await Promise.all([
           fetch(`${apiBase}/scanner/journal/summary`),
@@ -283,9 +303,17 @@
         const summary = await summaryResponse.json();
         const journal = await journalResponse.json();
         const performance = await performanceResponse.json();
-        els.journalSummary.textContent = summary.summary;
+        renderJournalSummary(summary.summary || "");
         renderJournal(journal.rows || []);
         renderPerformance(performance.performance || []);
+      }
+
+      async function loadModelProviders() {
+        const response = await fetch(`${apiBase}/agents/model-providers`);
+        if (!response.ok) return;
+        const payload = await response.json();
+        const active = payload.providers.find((provider) => provider.id === payload.active);
+        els.modelProvider.textContent = active ? active.label : "Math only";
       }
 
       async function scan() {
@@ -342,6 +370,7 @@
         loadJournal().catch(() => setState("API offline", "error"));
       });
       loadJournal().catch(() => setState("API offline", "error"));
+      loadModelProviders().catch(() => {});
     </script>
   </body>
 </html>

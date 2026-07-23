@@ -19,6 +19,26 @@ router = APIRouter()
 
 DataSource = Literal["yahoo_candles", "robinhood_mcp"]
 
+ROBINHOOD_VERIFIED_SCANNER_FILTERS = [
+    "FILTER_TYPE_INSTRUMENT_TYPE",
+    "FILTER_TYPE_MARKET_CAP",
+    "FILTER_TYPE_AVERAGE_VOLUME",
+    "FILTER_TYPE_RELATIVE_VOLUME",
+    "FILTER_TYPE_PERCENT_CHANGE_FROM_CLOSE",
+    "FILTER_TYPE_BID_PRICE",
+    "FILTER_TYPE_ASK_PRICE",
+    "FILTER_TYPE_LAST",
+    "FILTER_TYPE_VOLUME",
+    "FILTER_TYPE_EMA",
+    "FILTER_TYPE_VWAP",
+    "FILTER_TYPE_AVERAGE_TRUE_RANGE",
+    "FILTER_TYPE_SUPPORT",
+    "FILTER_TYPE_RESISTANCE",
+    "FILTER_TYPE_TOTAL_OPEN_INTEREST",
+    "FILTER_TYPE_TOTAL_OPTIONS_VOLUME",
+    "FILTER_TYPE_RELATIVE_OPTIONS_VOLUME",
+]
+
 
 @router.get("/signals")
 def scanner_signals(
@@ -34,10 +54,10 @@ def scanner_signals(
         raise HTTPException(
             status_code=501,
             detail=(
-                "Robinhood MCP is the intended source of truth, but its tools are not exposed "
-                "to this backend runtime yet. Keep paper scanning on yahoo_candles until a "
-                "Robinhood data adapter can call get_scanner_filter_specs and supported "
-                "Robinhood market/watchlist/option-chain tools."
+                "Robinhood MCP is verified in Codex and filter specs were read successfully, "
+                "but the FastAPI backend still needs a Robinhood adapter before it can call "
+                "the MCP directly. Keep paper scanning on yahoo_candles until the adapter "
+                "is implemented."
             ),
         )
 
@@ -81,11 +101,26 @@ def scanner_data_sources() -> dict[str, object]:
             {
                 "id": "robinhood_mcp",
                 "label": "Robinhood MCP",
-                "status": "not_exposed_to_backend",
+                "status": "codex_verified_backend_adapter_pending",
                 "trading_enabled": False,
                 "required_first_call": "get_scanner_filter_specs",
+                "verified_filter_count": len(ROBINHOOD_VERIFIED_SCANNER_FILTERS),
             },
         ],
+    }
+
+
+@router.get("/robinhood/filter-specs")
+def robinhood_filter_specs() -> dict[str, object]:
+    return {
+        "source": "get_scanner_filter_specs",
+        "status": "verified_in_codex",
+        "backend_adapter": "pending",
+        "filters": ROBINHOOD_VERIFIED_SCANNER_FILTERS,
+        "note": (
+            "Use these exact filter_type names when building the Robinhood scanner adapter. "
+            "The backend cannot call Robinhood MCP directly yet."
+        ),
     }
 
 
