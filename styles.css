@@ -405,6 +405,14 @@ th {
   background: #fbfaf7;
 }
 
+.symbol-performance-list {
+  display: grid;
+  gap: 7px;
+  padding: 10px;
+  border-bottom: 1px solid var(--line);
+  background: #fffdf8;
+}
+
 .performance-item {
   display: grid;
   grid-template-columns: 1fr repeat(4, auto);
@@ -417,12 +425,33 @@ th {
   font-size: 12px;
 }
 
+.symbol-performance-item {
+  display: grid;
+  grid-template-columns: 54px 76px repeat(3, auto);
+  gap: 8px;
+  align-items: center;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: white;
+  font-size: 12px;
+}
+
 .performance-item span {
+  color: var(--muted);
+}
+
+.symbol-performance-item span {
   color: var(--muted);
 }
 
 .performance-item b {
   color: var(--blue);
+}
+
+.symbol-performance-item b {
+  color: var(--blue);
+  font-family: "DM Mono", monospace;
 }
 
 .journal-item {

@@ -20,6 +20,7 @@ SetupName = Literal["continuation", "breakout", "rejection", "chop", "insufficie
 PatternSide = Literal["bullish", "bearish"]
 StratScenario = Literal["1", "2U", "2D", "3"]
 ScannerName = Literal["strat_fvg_liquidity", "orb_vwap_pullback"]
+AVAILABLE_SCANNERS: tuple[ScannerName, ...] = ("orb_vwap_pullback", "strat_fvg_liquidity")
 
 EASTERN = ZoneInfo("America/New_York")
 MARKET_OPEN = clock_time(9, 30)
@@ -1523,7 +1524,9 @@ def summarize_journal(journal_path: Path) -> str:
 
 def summarize_journal_performance(journal_path: Path) -> list[dict[str, object]]:
     rows = read_journal(journal_path)
-    scanners = sorted({row.get("scanner", "strat_fvg_liquidity") for row in rows})
+    scanners = sorted(
+        set(AVAILABLE_SCANNERS) | {row.get("scanner", "strat_fvg_liquidity") for row in rows}
+    )
     summaries: list[dict[str, object]] = []
     for scanner in scanners:
         scanner_rows = [
@@ -1552,7 +1555,58 @@ def summarize_journal_performance(journal_path: Path) -> list[dict[str, object]]
             }
         )
 
-    return summaries
+    return sorted(
+        summaries,
+        key=lambda summary: (
+            int(summary["closed"]) > 0,
+            float(summary["avg_result_pct"]),
+            float(summary["win_rate"]),
+            int(summary["closed"]),
+        ),
+        reverse=True,
+    )
+
+
+def summarize_symbol_performance(journal_path: Path) -> list[dict[str, object]]:
+    rows = read_journal(journal_path)
+    closed = [row for row in rows if row.get("status") in {"TARGET_1", "TARGET_2", "STOPPED"}]
+    keys = sorted(
+        {
+            (row.get("scanner", "strat_fvg_liquidity"), row.get("symbol", ""))
+            for row in closed
+            if row.get("symbol")
+        }
+    )
+    summaries: list[dict[str, object]] = []
+    for scanner, symbol in keys:
+        symbol_rows = [
+            row
+            for row in closed
+            if row.get("scanner", "strat_fvg_liquidity") == scanner and row.get("symbol") == symbol
+        ]
+        winners = [row for row in symbol_rows if row.get("status") in {"TARGET_1", "TARGET_2"}]
+        win_rate = (len(winners) / len(symbol_rows) * 100) if symbol_rows else 0
+        avg_result = mean(float(row["result_pct"]) for row in symbol_rows) if symbol_rows else 0
+        summaries.append(
+            {
+                "scanner": scanner,
+                "symbol": symbol,
+                "closed": len(symbol_rows),
+                "wins": len(winners),
+                "win_rate": round(win_rate, 1),
+                "avg_result_pct": round(avg_result, 3),
+            }
+        )
+
+    return sorted(
+        summaries,
+        key=lambda summary: (
+            float(summary["avg_result_pct"]),
+            float(summary["win_rate"]),
+            int(summary["closed"]),
+        ),
+        reverse=True,
+    )
 
 
 def run_once(

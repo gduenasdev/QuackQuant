@@ -7,6 +7,9 @@ from app.services.stock_monitor import (
     OpeningRangeBreakoutStrategy,
     has_open_trade,
     signal_to_journal_row,
+    summarize_journal_performance,
+    summarize_symbol_performance,
+    write_journal,
 )
 
 
@@ -88,3 +91,59 @@ def test_journal_duplicate_check_is_scanner_specific() -> None:
     row = signal_to_journal_row(orb_signal)
 
     assert not has_open_trade([row], strat_signal)
+
+
+def test_journal_performance_orders_best_scanner_first(tmp_path) -> None:
+    journal_path = tmp_path / "journal.csv"
+    write_journal(
+        journal_path,
+        [
+            {
+                "id": "orb-win",
+                "scanner": "orb_vwap_pullback",
+                "opened_at": "2026-07-23T09:45:00-04:00",
+                "closed_at": "2026-07-23T10:15:00-04:00",
+                "symbol": "SPY",
+                "side": "LONG",
+                "setup": "breakout",
+                "grade": "A",
+                "confidence": "90",
+                "entry_price": "100",
+                "stop_price": "99",
+                "target_1_price": "101",
+                "target_2_price": "102",
+                "last_price": "101",
+                "status": "TARGET_1",
+                "result_pct": "1.000",
+                "reasons": "test",
+            },
+            {
+                "id": "strat-loss",
+                "scanner": "strat_fvg_liquidity",
+                "opened_at": "2026-07-23T09:45:00-04:00",
+                "closed_at": "2026-07-23T10:15:00-04:00",
+                "symbol": "QQQ",
+                "side": "SHORT",
+                "setup": "continuation",
+                "grade": "A",
+                "confidence": "90",
+                "entry_price": "100",
+                "stop_price": "101",
+                "target_1_price": "99",
+                "target_2_price": "98",
+                "last_price": "101",
+                "status": "STOPPED",
+                "result_pct": "-1.000",
+                "reasons": "test",
+            },
+        ],
+    )
+
+    performance = summarize_journal_performance(journal_path)
+
+    assert performance[0]["scanner"] == "orb_vwap_pullback"
+
+    symbol_performance = summarize_symbol_performance(journal_path)
+
+    assert symbol_performance[0]["symbol"] == "SPY"
+    assert symbol_performance[0]["scanner"] == "orb_vwap_pullback"

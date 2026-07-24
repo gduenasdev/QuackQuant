@@ -23,6 +23,14 @@ def test_scanner_journal_performance() -> None:
     response = client.get("/api/v1/scanner/journal/performance")
 
     assert response.status_code == 200
+    scanners = {row["scanner"] for row in response.json()["performance"]}
+    assert {"orb_vwap_pullback", "strat_fvg_liquidity"} <= scanners
+
+
+def test_scanner_symbol_performance() -> None:
+    response = client.get("/api/v1/scanner/journal/symbol-performance")
+
+    assert response.status_code == 200
     assert "performance" in response.json()
 
 

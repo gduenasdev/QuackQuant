@@ -12,6 +12,7 @@ from app.services.stock_monitor import (
     run_once,
     summarize_journal,
     summarize_journal_performance,
+    summarize_symbol_performance,
     update_journal,
 )
 
@@ -140,3 +141,8 @@ def scanner_journal_summary() -> dict[str, str]:
 @router.get("/journal/performance")
 def scanner_journal_performance() -> dict[str, object]:
     return {"performance": summarize_journal_performance(DEFAULT_JOURNAL_PATH)}
+
+
+@router.get("/journal/symbol-performance")
+def scanner_symbol_performance() -> dict[str, object]:
+    return {"performance": summarize_symbol_performance(DEFAULT_JOURNAL_PATH)}

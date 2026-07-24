@@ -140,6 +140,9 @@
           <div id="performance-list" class="performance-list">
             <p class="empty">Scanner performance appears after recorded calls.</p>
           </div>
+          <div id="symbol-performance-list" class="symbol-performance-list">
+            <p class="empty">Ticker performance appears after closed calls.</p>
+          </div>
           <div id="journal-list" class="journal-list">
             <p class="empty">Recorded LONG/SHORT calls will appear here.</p>
           </div>
@@ -171,6 +174,7 @@
         journalSummary: document.getElementById("journal-summary"),
         journalList: document.getElementById("journal-list"),
         performanceList: document.getElementById("performance-list"),
+        symbolPerformanceList: document.getElementById("symbol-performance-list"),
         refreshJournal: document.getElementById("refresh-journal"),
       };
       let autoTimer = null;
@@ -234,9 +238,9 @@
           return;
         }
 
-        els.journalList.innerHTML = rows
-          .slice(-12)
-          .reverse()
+        els.journalList.innerHTML = [...rows]
+          .sort((a, b) => Number(b.result_pct || 0) - Number(a.result_pct || 0))
+          .slice(0, 12)
           .map(
             (row) => `
               <article class="journal-item">
@@ -248,6 +252,29 @@
                   <span>${row.status}</span>
                   <b>${Number(row.result_pct || 0).toFixed(3)}%</b>
                 </div>
+              </article>
+            `,
+          )
+          .join("");
+      }
+
+      function renderSymbolPerformance(performance) {
+        if (!performance.length) {
+          els.symbolPerformanceList.innerHTML =
+            '<p class="empty">Ticker performance appears after closed calls.</p>';
+          return;
+        }
+
+        els.symbolPerformanceList.innerHTML = performance
+          .slice(0, 8)
+          .map(
+            (item) => `
+              <article class="symbol-performance-item">
+                <strong>${item.symbol}</strong>
+                <span>${prettyScanner(item.scanner)}</span>
+                <span>${item.closed} closed</span>
+                <span>${item.win_rate}% win</span>
+                <b>${Number(item.avg_result_pct || 0).toFixed(3)}%</b>
               </article>
             `,
           )
@@ -287,25 +314,38 @@
         els.journalSummary.innerHTML = `
           <span><strong>${filename}</strong></span>
           <span>total=${parts.total || 0} open=${parts.open || 0} closed=${parts.closed || 0}</span>
-          <span>wins=${parts.wins || 0} win_rate=${parts.win_rate || "0.0%"} avg=${parts.avg_result_pct || "0.000%"}</span>
+          <span>wins=${parts.wins || 0} win_rate=${parts.win_rate || "0.0%"} avg=${parts.avg_result || "0.000%"}</span>
         `;
       }
 
       async function loadJournal() {
-        const [summaryResponse, journalResponse, performanceResponse] = await Promise.all([
+        const [
+          summaryResponse,
+          journalResponse,
+          performanceResponse,
+          symbolPerformanceResponse,
+        ] = await Promise.all([
           fetch(`${apiBase}/scanner/journal/summary`),
           fetch(`${apiBase}/scanner/journal`),
           fetch(`${apiBase}/scanner/journal/performance`),
+          fetch(`${apiBase}/scanner/journal/symbol-performance`),
         ]);
-        if (!summaryResponse.ok || !journalResponse.ok || !performanceResponse.ok) {
+        if (
+          !summaryResponse.ok ||
+          !journalResponse.ok ||
+          !performanceResponse.ok ||
+          !symbolPerformanceResponse.ok
+        ) {
           throw new Error("Journal API unavailable");
         }
         const summary = await summaryResponse.json();
         const journal = await journalResponse.json();
         const performance = await performanceResponse.json();
+        const symbolPerformance = await symbolPerformanceResponse.json();
         renderJournalSummary(summary.summary || "");
         renderJournal(journal.rows || []);
         renderPerformance(performance.performance || []);
+        renderSymbolPerformance(symbolPerformance.performance || []);
       }
 
       async function loadModelProviders() {
